@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel
 import pandas as pd
+import copy
 
 from sklearn.decomposition import PCA
 from sklearn.covariance import EllipticEnvelope
@@ -13,6 +14,9 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.svm import SVC
 from sklearn.model_selection import cross_val_score, train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.linear_model import LogisticRegression
+
+import xgboost as xgb
 
 from scipy.stats import entropy
 
@@ -21,123 +25,339 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 
-class BinaryDetector:
-    """
-    Handles only SVM training and prediction.
-    Works with pre-extracted embeddings - no embedding extraction logic.
-    """
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+
+class NeuralClassifier(nn.Module):
+    def __init__(self, input_dim=4096, hidden_dims=[1024, 512], dropout_rate=0.2):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        
+        # Input layer
+        self.layers.append(nn.Linear(input_dim, hidden_dims[0]))
+        self.layers.append(nn.Tanh())
+        self.layers.append(nn.Dropout(dropout_rate))
+        
+        # Hidden layers
+        for i in range(len(hidden_dims)-1):
+            self.layers.append(nn.Linear(hidden_dims[i], hidden_dims[i+1]))
+            self.layers.append(nn.Tanh())
+            self.layers.append(nn.Dropout(dropout_rate))
+            
+        # Output layer
+        self.layers.append(nn.Linear(hidden_dims[-1], 1))
+        self.layers.append(nn.Sigmoid())
+        
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+class DeepBinaryDetector:
+    def __init__(self, input_dim=4096, hidden_dims=[1024, 512], device='cuda'):
+        self.device = device
+        self.model = NeuralClassifier(input_dim, hidden_dims).to(device)
+        self.scaler = StandardScaler()
+        self._is_fitted = False
+        
+    def fit(self, embeddings, labels, validation_split=0.2, 
+        epochs=10, batch_size=32, lr=0.001):
+        # Preprocess
+        embeddings = self.scaler.fit_transform(embeddings)
+        # Move data to CPU before splitting
+        if isinstance(labels, torch.Tensor):
+            labels = labels.cpu().numpy()
+        
+        X = torch.FloatTensor(embeddings)
+        y = torch.FloatTensor(labels)
+        
+        # Train/val split on CPU
+        if validation_split > 0:
+            X_train, X_val, y_train, y_val = train_test_split(
+                X.cpu().numpy(), y.cpu().numpy(), 
+                test_size=validation_split, 
+                stratify=y.cpu().numpy()
+            )
+            # Convert back to tensors and move to device
+            X_train = torch.FloatTensor(X_train).to(self.device)
+            X_val = torch.FloatTensor(X_val).to(self.device)
+            y_train = torch.FloatTensor(y_train).to(self.device)
+            y_val = torch.FloatTensor(y_val).to(self.device)
+        else:
+            X_train, y_train = X.to(self.device), y.to(self.device)
+            X_val, y_val = None, None
+            
+        # Create dataloaders
+        train_dataset = TensorDataset(X_train, y_train.view(-1, 1))
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        
+        if X_val is not None:
+            val_dataset = TensorDataset(X_val, y_val.view(-1, 1))
+            val_loader = DataLoader(val_dataset, batch_size=batch_size)
+        
+        # Training setup
+        criterion = nn.BCELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        best_val_loss = float('inf')
+        best_model = None
+        
+        # Training loop
+        for epoch in range(epochs):
+            self.model.train()
+            train_loss = 0
+            for batch_X, batch_y in train_loader:
+                optimizer.zero_grad()
+                outputs = self.model(batch_X)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+            
+            # Validation
+            if X_val is not None:
+                self.model.eval()
+                val_loss = 0
+                val_preds = []
+                val_true = []
+                
+                with torch.no_grad():
+                    for batch_X, batch_y in val_loader:
+                        outputs = self.model(batch_X)
+                        val_loss += criterion(outputs, batch_y).item()
+                        val_preds.extend((outputs > 0.5).cpu().numpy())
+                        val_true.extend(batch_y.cpu().numpy())
+                
+                val_acc = accuracy_score(val_true, val_preds)
+                print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss/len(train_loader):.4f}, '
+                      f'Val Loss: {val_loss/len(val_loader):.4f}, Val Acc: {val_acc:.4f}')
+                
+                # Save best model
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_model = copy.deepcopy(self.model.state_dict())
+            
+        # Load best model
+        if best_model is not None:
+            self.model.load_state_dict(best_model)
+        
+        self._is_fitted = True
+        return {'val_accuracy': val_acc if X_val is not None else None}
     
-    def __init__(self, n_components=0.95, contamination=0.1, random_state=42):
+    def predict(self, embeddings, return_probabilities=True):
+        """
+        Predict using the trained neural network
+        Args:
+            embeddings: numpy array of embeddings
+            return_probabilities: whether to return probabilities along with predictions
+        Returns:
+            predictions: binary predictions (0=real, 1=fake)
+            probabilities: probability of being fake (if return_probabilities=True)
+        """
+        if not self._is_fitted:
+            raise ValueError("Model not fitted yet!")
+            
+        # Preprocess embeddings
+        embeddings = self.scaler.transform(embeddings)
+        X = torch.FloatTensor(embeddings).to(self.device)
+        
+        # Get model predictions
+        self.model.eval()
+        with torch.no_grad():
+            outputs = self.model(X)
+            probs = outputs.cpu().numpy().squeeze()
+            preds = (probs > 0.5).astype(int)
+        
+        # Return predictions and optionally probabilities 
+        if return_probabilities:
+            return preds, probs
+        return preds
+    
+class BinaryDetector:
+    """Handles binary classification with optional PCA reduction"""
+    
+    def __init__(self, n_components=None, contamination=0.1, random_state=42, input_dim=None):
         """
         Args:
-            n_components: PCA components (float for variance ratio, int for number)
-            contamination: Expected fraction of outliers (not used for SVM)
+            n_components: Optional PCA components (None for no PCA)
+            contamination: Expected fraction of outliers
             random_state: Random state for reproducibility
+            input_dim: Input dimension for neural classifier
         """
         self.scaler = StandardScaler()
-        self.pca = PCA(n_components=n_components)
+        self.pca = None  # Only initialize PCA if needed
+        self.n_components = n_components
         self.random_state = random_state
+        self.input_dim = input_dim  # Store raw input dimension
         
-        # SVM components
-        self.svm_classifier = None
+        # Components
+        self.classifier = None
         self.real_centroid = None
-        
-        # Fitted flags
         self._is_fitted = False
     
-    def _init_svm(self):
-        """Initialize SVM classifier"""
-        return SVC(
-            kernel='rbf',
-            probability=True,
-            random_state=self.random_state,
-            class_weight='balanced'
-        )
+    def _init_classifier(self, classifier_type="svm"):
+        """Initialize classifier (SVM or logistic regression)"""
+        if classifier_type == "svm":
+            return SVC(
+                kernel='rbf',
+                probability=True,
+                random_state=self.random_state,
+                class_weight='balanced'
+            )
+        elif classifier_type == "lr":
+            
+            return LogisticRegression(
+                random_state=self.random_state,
+                class_weight='balanced',
+                max_iter=1000
+            )
+        elif classifier_type== "xgb":
+            return xgb.XGBClassifier(
+                objective="binary:logistic",
+                eval_metric="logloss",
+                max_depth=7,
+                learning_rate=0.01,
+                n_estimators=500,
+                use_label_encoder=False,
+                random_state=self.random_state
+            )
+        elif classifier_type == "neural":
+            # Use PCA-reduced dim if PCA is fitted, else raw input dim
+            dim = self.pca.n_components_ if self.pca is not None else self.input_dim
+            return DeepBinaryDetector(
+                input_dim=dim,
+                device='cuda' if torch.cuda.is_available() else 'cpu'
+            )
+
+        else:
+            raise ValueError(f"Unknown classifier_type: {classifier_type}")
+        
+    def _preprocess_features(self, features, fit=False):
+        """Preprocess features with scaling and optional PCA"""
+        # Always scale
+        if fit:
+            features = self.scaler.fit_transform(features)
+        else:
+            features = self.scaler.transform(features)
+            
+        # Apply PCA if specified
+        if self.n_components is not None:
+            if self.pca is None:
+                self.pca = PCA(n_components=self.n_components)
+                features = self.pca.fit_transform(features)
+                print(f"PCA reduced shape: {features.shape}")
+                print(f"Explained variance ratio: {self.pca.explained_variance_ratio_.sum():.3f}")
+            else:
+                features = self.pca.transform(features)
+                
+        return features
     
-    def fit(self, embeddings, labels, validation_split=0.2):
+    def fit(self, embeddings, labels, validation_split=0.2, classifier_type="svm", pca=True):
         """
-        Train the SVM classifier on embeddings
+        Train the classifier on embeddings
         
         Args:
             embeddings: numpy array of shape (n_samples, embedding_dim)
             labels: numpy array of shape (n_samples,) with binary labels (0=real, 1=fake)
             validation_split: Fraction of data for validation (0 for no validation)
+            classifier_type: Type of classifier ("svm", "lr", "xgb", "neural")
+            pca: Whether to apply PCA dimensionality reduction
             
         Returns:
             training_results: Dictionary with training metrics
         """
-        print(f"Training SVM on {embeddings.shape[0]} samples...")
+
+        # Store raw input dimension
+        self.input_dim = embeddings.shape[1]
         
-        # Check for NaN/Inf
-        n_nan = np.isnan(embeddings).sum()
-        n_inf = np.isinf(embeddings).sum()
-        if n_nan > 0 or n_inf > 0:
-            print(f"Warning: Found {n_nan} NaN and {n_inf} Inf values in embeddings")
-            # Could add cleaning logic here
-        
-        # Preprocessing
-        embeddings_scaled = self.scaler.fit_transform(embeddings)
-        embeddings_pca = self.pca.fit_transform(embeddings_scaled)
-        
-        print(f"PCA reduced shape: {embeddings_pca.shape}")
-        print(f"Explained variance ratio: {self.pca.explained_variance_ratio_.sum():.3f}")
-        
+        # Preprocess features
+        features = self._preprocess_features(embeddings, fit=True)
+
         # Calculate real centroid for distance calculations
         real_mask = (labels == 0)
         if np.sum(real_mask) > 0:
-            self.real_centroid = np.mean(embeddings_pca[real_mask], axis=0)
+            self.real_centroid = np.mean(embeddings[real_mask], axis=0)
         else:
             print("Warning: No real samples found (label=0)")
-            self.real_centroid = np.mean(embeddings_pca, axis=0)
+            self.real_centroid = np.mean(embeddings, axis=0)
         
         # Train/validation split if requested
-        if validation_split > 0 and len(embeddings_pca) > 50:
+        if validation_split > 0 and len(embeddings) > 50:
             X_train, X_val, y_train, y_val = train_test_split(
-                embeddings_pca, labels,
+                features, labels,
                 test_size=validation_split,
                 random_state=self.random_state,
                 stratify=labels
             )
         else:
-            X_train, y_train = embeddings_pca, labels
+            X_train, y_train = features, labels
             X_val, y_val = None, None
         
-        # Train SVM
-        print("Fitting SVM classifier...")
-        self.svm_classifier = self._init_svm()
-        self.svm_classifier.fit(X_train, y_train)
+        # Train classifier
+        print(f"Fitting {classifier_type.upper()} classifier...")
+        self.classifier = self._init_classifier(classifier_type)
+        
+        # Handle neural network training separately
+        if classifier_type == "neural":
+            training_results = self.classifier.fit(
+                X_train, y_train, 
+                validation_split=validation_split if X_val is None else 0.0,
+                epochs=10, 
+                batch_size=32, 
+                lr=0.001
+            )
+            val_acc = training_results.get('val_accuracy')
+            
+            # Get training predictions (neural network returns tuple)
+            train_pred = self.classifier.predict(X_train, return_probabilities=False)
+        else:
+            # Standard sklearn-style classifiers
+            self.classifier.fit(X_train, y_train)
+            train_pred = self.classifier.predict(X_train)
+            val_acc = None
         
         # Training metrics
-        train_pred = self.svm_classifier.predict(X_train)
         train_acc = accuracy_score(y_train, train_pred)
         
-        results = {
-            'train_accuracy': train_acc,
-            'n_samples': len(embeddings),
-            'n_features': embeddings_pca.shape[1],
-            'n_components': self.pca.n_components_
-        }
+        if pca:
+            results = {
+                'train_accuracy': train_acc,
+                'n_samples': len(embeddings),
+                'n_features': embeddings.shape[1],
+                'n_components': self.pca.n_components_
+            }
+        else:
+            results = {
+                'train_accuracy': train_acc,
+                'n_samples': len(embeddings),
+                'n_features': embeddings.shape[1],
+                'n_components': embeddings.shape[1]
+            }
         
         print(f"Training accuracy: {train_acc:.3f}")
         print("Training Classification Report:")
         print(classification_report(y_train, train_pred, target_names=['Real', 'Fake']))
         
         # Validation metrics if available
-        if X_val is not None:
-            val_pred = self.svm_classifier.predict(X_val)
+        if X_val is not None and classifier_type != "neural":
+            val_pred = self.classifier.predict(X_val)
             val_acc = accuracy_score(y_val, val_pred)
             results['val_accuracy'] = val_acc
             
             print(f"Validation accuracy: {val_acc:.3f}")
             print("Validation Classification Report:")
             print(classification_report(y_val, val_pred, target_names=['Real', 'Fake']))
+        elif val_acc is not None:
+            results['val_accuracy'] = val_acc
+            print(f"Validation accuracy: {val_acc:.3f}")
         
         self._is_fitted = True
-        print("SVM training completed!")
+        print(f"{classifier_type.upper()} training completed!")
         
         return results
     
-    def predict(self, embeddings, return_probabilities=True, return_distances=True):
+    def predict(self, embeddings, return_probabilities=True, return_distances=True, pca=True):
         """
         Predict labels for embeddings
         
@@ -145,6 +365,7 @@ class BinaryDetector:
             embeddings: numpy array of shape (n_samples, embedding_dim)
             return_probabilities: Whether to return prediction probabilities
             return_distances: Whether to return distances to real centroid
+            pca: Whether to apply PCA transformation
             
         Returns:
             predictions: numpy array of predictions (0=real, 1=fake)
@@ -154,40 +375,52 @@ class BinaryDetector:
         if not self._is_fitted:
             raise ValueError("Detector not fitted! Call fit() first.")
         
-        # Preprocess embeddings
-        embeddings_scaled = self.scaler.transform(embeddings)
-        embeddings_pca = self.pca.transform(embeddings_scaled)
+        features = self._preprocess_features(embeddings, fit=False)
         
-        # Predictions
-        predictions = self.svm_classifier.predict(embeddings_pca)
+        # Check if classifier is neural network
+        is_neural = isinstance(self.classifier, DeepBinaryDetector)
         
+        # Get predictions
+        if is_neural:
+            # Neural network was trained on preprocessed features; reuse them here
+            if return_probabilities:
+                predictions, probabilities = self.classifier.predict(features, return_probabilities=True)
+            else:
+                predictions = self.classifier.predict(features, return_probabilities=False)
+        else:
+            # Standard sklearn classifiers
+            predictions = self.classifier.predict(features)
+            if return_probabilities:
+                probabilities = self.classifier.predict_proba(features)[:, 1]  # P(fake)
+        
+        # Build results list
         results = [predictions]
         
         if return_probabilities:
-            probabilities = self.svm_classifier.predict_proba(embeddings_pca)[:, 1]  # P(fake)
             results.append(probabilities)
         
         if return_distances:
-            distances = np.linalg.norm(embeddings_pca - self.real_centroid, axis=1)
+            distances = np.linalg.norm(embeddings - self.real_centroid, axis=1)
             results.append(distances)
         
         return results if len(results) > 1 else results[0]
-    
-    def predict_pairs(self, embeddings_1, embeddings_2):
+
+    def predict_pairs(self, embeddings_1, embeddings_2, pca=True):
         """
         Predict which text in each pair is real
         
         Args:
             embeddings_1: embeddings for first texts in pairs
             embeddings_2: embeddings for second texts in pairs
+            pca: Whether to apply PCA transformation
             
         Returns:
             pair_predictions: 1 if first text is real, 2 if second text is real
             details: detailed predictions for each text
         """
         # Get predictions for both sets
-        pred_1, prob_1, dist_1 = self.predict(embeddings_1)
-        pred_2, prob_2, dist_2 = self.predict(embeddings_2)
+        pred_1, prob_1, dist_1 = self.predict(embeddings_1, pca=pca)
+        pred_2, prob_2, dist_2 = self.predict(embeddings_2, pca=pca)
         
         # For each pair, choose text with higher probability of being real
         prob_real_1 = 1 - prob_1  # Convert P(fake) to P(real)
@@ -283,14 +516,8 @@ class OutlierDetections:
         """
         print(f"Training {self.detector_type} outlier detector on {embeddings.shape[0]} samples...")
         
-        # Filter to only real samples (label=0)
-        real_mask = (labels == 0)
-        real_embeddings = embeddings[real_mask]
-        
-        if len(real_embeddings) == 0:
-            raise ValueError("No real samples found (label=0). Cannot train outlier detector.")
-            
-        print(f"Using {len(real_embeddings)} real samples out of {len(embeddings)} total samples")
+
+        real_embeddings = embeddings
         
         # Check for NaN/Inf
         n_nan = np.isnan(real_embeddings).sum()
