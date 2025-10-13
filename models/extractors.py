@@ -1,7 +1,8 @@
+from typing import Dict, List, Union
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel
-
+import torch.nn.functional as F
 from tqdm import tqdm
 
 ### ------------- model to extract embedding from decoder or encoder language models
@@ -11,23 +12,38 @@ class EmbeddingExtractor(torch.nn.Module):
     outputs is a a vector for each text
     """
 
-    def __init__(self, model_name="distilbert-base-uncased", device=None):
+    def __init__(self, model_name="distilbert-base-uncased", device=None, use_flash_attention=False, is_qwen3=None):
         super().__init__()
         
         self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
 
-        print(f"Loading model: {model_name}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if is_qwen3 is None:
+            self.is_qwen3 = 'qwen3' in model_name.lower() and 'embedding' in model_name.lower()
+        else:
+            self.is_qwen3 = is_qwen3
 
-        self.model = AutoModel.from_pretrained(
+        padding_side = 'left' if self.is_qwen3 else 'right'
+
+        print(f"Loading model: {model_name}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side=padding_side)
+
+        if use_flash_attention and self.device == 'cuda':
+            print("Loading with Flash Attention 2...")
+            self.model = AutoModel.from_pretrained(
                 model_name,
-                dtype=torch.float16,  
-                device_map=None  
+                torch_dtype=torch.float16,
+                attn_implementation="flash_attention_2",
+                device_map=None
+            )
+        else:
+            self.model = AutoModel.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map=None
             )
         
         self.model = self.model.to(self.device)
-        
         self.model.eval()
 
         # Add padding token if missing
@@ -53,156 +69,159 @@ class EmbeddingExtractor(torch.nn.Module):
             print(f" Model test failed: {e}")
             return False
         
-    def get_all_layer_embeddings(self, texts, pooling='mean', batch_size=16):
+    def get_all_layer_embeddings(
+        self, 
+        texts: Union[str, List[str]], 
+        batch_size: int = 16,
+        max_length: int = 8192,  # Support long context
+        show_progress=True
+    ) -> List[Dict[int, np.ndarray]]:
         """
         Extract embeddings from ALL layers for one or more texts, in batches.
+        we want as output only vectors that wont be batched anymore so this must also remove the padding made by tokenizer
+        
         Args:
             texts: list[str] or str
-            pooling: 'mean', 'cls', 'max', or 'all'
             batch_size: number of texts per forward pass
+            max_length: maximum sequence length
+            
         Returns:
-            dict: {layer_idx: np.ndarray of shape (num_texts, hidden_size)} 
-                OR for 'all' pooling: {layer_idx: np.ndarray of shape (total_tokens, hidden_size)}
+        all_texts_embeddings
+                [
+            {0: emb_layer0, 1: emb_layer1, ..., N: emb_layerN},   # embeddings for text 1
+            {0: emb_layer0, 1: emb_layer1, ..., N: emb_layerN},   # embeddings for text 2
+            ...
+            ]
+
         """
         if isinstance(texts, str):
             texts = [texts]
-
-        layer_embeddings = {}  # Will store final results
         
-        # Handle 'all' pooling separately as it has different output structure
-        if pooling == 'all':
-            return self._get_all_token_embeddings(texts, batch_size)
+        all_texts_embeddings = []
 
-        for i in range(0, len(texts), batch_size):
+
+        iterator = range(0, len(texts), batch_size)
+        if show_progress and len(texts) > batch_size:
+            iterator = tqdm(iterator, desc="Extracting embeddings")
+        for i in iterator:
             batch = texts[i:i+batch_size]
-
             model_inputs = self.tokenizer(
                 batch,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=512
+                max_length=max_length,
+                
             )
-
-            # Move each tensor explicitly to device
             model_inputs = {k: v.to(self.device) for k, v in model_inputs.items()}
-            input_ids = model_inputs['input_ids']
-            attention_mask = model_inputs['attention_mask']
-
-            with torch.no_grad():
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True
-                )
-            
-            # Process each layer
-            batch_layer_embeddings = {}
-            for layer_idx, hidden_state in enumerate(outputs.hidden_states):
-                # hidden_state shape: [batch_size, seq_len, hidden_size]
-                # attention_mask shape: [batch_size, seq_len]
-                if pooling == 'mean':
-                    # Expand attention mask to match hidden state dimensions
-                    mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_state.size()).float()
-                    # Apply mask
-                    masked_embeddings = hidden_state * mask_expanded
-                    
-                    
-                    # Sum over sequence length and divide by actual lengths
-                    sum_embeddings = masked_embeddings.sum(dim=1)  # [batch_size, hidden_size]
-                    seq_lengths = attention_mask.sum(dim=1).unsqueeze(-1).float()  # [batch_size, 1]
-
-                    embedding = sum_embeddings / seq_lengths.clamp(min=1)
-                    
-                elif pooling == 'cls':
-                    embedding = hidden_state[:, 0, :]  # [batch_size, hidden_size]
-                    
-                elif pooling == 'max':
-                    # Apply mask before max pooling
-                    mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_state.size()).float()
-                    masked_embeddings = hidden_state * mask_expanded + (1 - mask_expanded) * (-1e9)
-                    embedding = torch.max(masked_embeddings, dim=1)[0]  # [batch_size, hidden_size]
-                elif pooling == 'last_token':
-                    # Get the last non-padding token for each sequence
-                    batch_size = hidden_state.shape[0]
-                    
-                    # Check if we have left padding (rare) or right padding (common)
-                    # For right padding, we want the last valid token before padding starts
-                    sequence_lengths = attention_mask.sum(dim=1) - 1  # -1 because we want last valid index
-                    
-                    # Extract last valid token for each sequence in batch
-                    batch_indices = torch.arange(batch_size, device=hidden_state.device)
-                    embedding = hidden_state[batch_indices, sequence_lengths]  # [batch_size, hidden_size]
-                else:
-                    raise ValueError(f"Unsupported pooling method: {pooling}")
-
-                batch_layer_embeddings[layer_idx] = embedding.cpu().numpy()
-
-            # Concatenate with previous batches
-            if not layer_embeddings:  # First batch
-                layer_embeddings = batch_layer_embeddings
-            else:
-                for layer_idx in layer_embeddings.keys():
-                    layer_embeddings[layer_idx] = np.vstack([
-                        layer_embeddings[layer_idx], 
-                        batch_layer_embeddings[layer_idx]
-                    ])
-
-        return layer_embeddings
-    
-    def _get_all_token_embeddings(self, texts, batch_size):
-        """
-        Separate method for 'all' pooling to handle different output structure
-        """
-        layer_embeddings = {}
-        
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i+batch_size]
-
-            model_inputs = self.tokenizer(
-                batch,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512
-            )
-
-            model_inputs = {k: v.to(self.device) for k, v in model_inputs.items()}
-            attention_mask = model_inputs['attention_mask']
-
             with torch.no_grad():
                 outputs = self.model(**model_inputs, output_hidden_states=True)
 
-            batch_layer_embeddings = {}
-            for layer_idx, hidden_state in enumerate(outputs.hidden_states):
-                # Extract only valid (non-padding) tokens
-                embedding_list = []
-                mask = attention_mask.bool()  # [batch_size, seq_len]
-                
-                for b in range(hidden_state.size(0)):
-                    # Ensure mask indices are proper integer types
-                    valid_mask = mask[b].cpu()  # Move to CPU to avoid CUDA tensor type issues
-                    valid_indices = torch.where(valid_mask)[0]  # Get indices of valid tokens
+            attention_mask = model_inputs['attention_mask']
+            
+            # For each text in the batch
+            for b in range(len(batch)):
+                    text_layer_embeddings = {}
+                    valid_indices = torch.where(attention_mask[b].bool())[0]
                     
-                    if len(valid_indices) > 0:
-                        # Use integer indexing instead of boolean masking on CUDA tensors
-                        valid_tokens = hidden_state[b][valid_indices]  # [valid_seq_len, hidden_size]
-                        embedding_list.append(valid_tokens)
-                
-                # Concatenate all valid tokens from this batch
-                if embedding_list:
-                    batch_embeddings = torch.cat(embedding_list, dim=0)  # [total_valid_tokens, hidden_size]
-                    batch_layer_embeddings[layer_idx] = batch_embeddings.cpu().numpy()
+                    if len(valid_indices) == 0:
+                        print("attenton no valid indices")
+                        print(outputs.hidden_states[b].shape)
+                        print(f"Text: {repr(batch[b])}")
+                        print(attention_mask[b].bool())
 
-            # Concatenate with previous batches
-            if not layer_embeddings:  # First batch
-                layer_embeddings = batch_layer_embeddings
-            else:
-                for layer_idx in layer_embeddings.keys():
-                    if layer_idx in batch_layer_embeddings:
-                        layer_embeddings[layer_idx] = np.vstack([
-                            layer_embeddings[layer_idx], 
-                            batch_layer_embeddings[layer_idx]
-                        ])
+                    for layer_idx, hidden_state in enumerate(outputs.hidden_states):
+                        
+                        # Keep full sequence, no pooling
+                        valid_tokens = hidden_state[b][valid_indices]
+                        text_layer_embeddings[layer_idx] = valid_tokens.cpu().numpy()  # (seq, hidden)
+                    
+                    all_texts_embeddings.append(text_layer_embeddings)
 
-        return layer_embeddings
+        assert len(all_texts_embeddings) == len(texts)
+        return all_texts_embeddings
+
+#### --------------------------------------------- from embeddings generate features for classification --------------------------------------------
+
+def extract_embed_at_layer(list_embeds, layer_idx):
+    """
+    Args:
+        list_embeds: obtained from EmbeddingExtractor
+            [
+            {0: emb_layer0, 1: emb_layer1, ..., N: emb_layerN},   # embeddings for text 1
+            {0: emb_layer0, 1: emb_layer1, ..., N: emb_layerN},   # embeddings for text 2
+            ...
+            ]
+        layer_idx: int for the layer
+    Returns:
+        List of numpy arrays: all hidden states per text at a specific layer  
+            emb_layerk_textk has shape shape (seq,hidden_size)
+                (here for each text seq will be different)
+            [ emb_layerk_text0, ... , emb_layerk_textk, ..., emb_layerk_lasttext ]
+    """
+
+    if layer_idx not in list_embeds[0]:
+        raise ValueError(f"Layer {layer_idx} not found. Available: {list(list_embeds[0].keys())}")
+    
+    selected_embeds_at_choosen_layer = [list_embeds_per_text[layer_idx] for list_embeds_per_text in list_embeds]
+
+    return selected_embeds_at_choosen_layer
+
+def pool_embeds_from_layer(selected_embeds_at_choosen_layer, pooling='mean'):
+    """
+    Args:
+        selected_embeds_at_choosen_layer: obtained from EmbeddingExtractor
+            [ emb_layerk_text0, ... , emb_layerk_textk, ..., emb_layerk_lasttext]
+        pooling: method to pool vectors
+
+    Returns:
+        numpy array of shape (num_texts, hidden_size)
+
+    """
+    list_pooled = []
+    for idx, emb in enumerate(selected_embeds_at_choosen_layer):   # emb shape: (seq, hidden)
+        if emb.size == 0:
+            print(f"⚠️  Warning: Empty embedding at index {idx}, using zeros")
+            print(emb)
+            pooled_emb = np.zeros(emb.shape[1] if len(emb.shape) > 1 else 768)
+        elif np.isnan(emb).all():
+            print(f"⚠️  Warning: All-NaN embedding at index {idx}, using zeros")
+            pooled_emb = np.zeros(emb.shape[1] if len(emb.shape) > 1 else 768)
+        if pooling == 'mean':
+            pooled_emb = emb.mean(axis=0)  # (hidden,)
+        elif pooling == 'max':
+            pooled_emb = emb.max(axis=0)  # (hidden,)
+        elif pooling == 'first':
+            pooled_emb = emb[0]  # (hidden,)
+        elif pooling == 'last':
+            pooled_emb = emb[-1]  # (hidden,)
+        else:
+            raise ValueError(f"Unsupported pooling: {pooling}")
+        
+        list_pooled.append(pooled_emb)
+    
+    return np.array(list_pooled)
+
+
+
+
+if __name__ == "__main__":
+    # Initialize
+    #"Qwen/Qwen2.5-0.5B"
+    #"meta-llama/Llama-3.1-8B"
+    calc = PerplexityCalculator(model_name="Qwen/Qwen2.5-0.5B",device='cuda:2')
+    
+    # Sample texts
+    texts = [
+        "The quick brown fox jumps over the lazy dog.",
+        "asdf jkl qwerty zxcv random nonsense words here",
+        "Machine learning is a subset of artificial intelligence that focuses on algorithms.",
+    ]
+    
+    # Calculate perplexities
+    perplexities = calc.calculate_batch_perplexity(texts)
+    
+    # Display results
+    for text, ppl in zip(texts, perplexities):
+        print(f"Text: {text[:50]}...")
+        print(f"Perplexity: {ppl:.2f}\n")
