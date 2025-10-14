@@ -37,13 +37,15 @@ class NeuralClassifier(nn.Module):
         
         # Input layer
         self.layers.append(nn.Linear(input_dim, hidden_dims[0]))
-        self.layers.append(nn.Tanh())
+        self.layers.append(nn.BatchNorm1d(hidden_dims[0]))  # Batch Normalization
+        self.layers.append(nn.ReLU())  # Changed to ReLU
         self.layers.append(nn.Dropout(dropout_rate))
         
         # Hidden layers
         for i in range(len(hidden_dims)-1):
             self.layers.append(nn.Linear(hidden_dims[i], hidden_dims[i+1]))
-            self.layers.append(nn.Tanh())
+            self.layers.append(nn.BatchNorm1d(hidden_dims[i+1]))  # Batch Normalization
+            self.layers.append(nn.ReLU())  # Changed to ReLU
             self.layers.append(nn.Dropout(dropout_rate))
             
         # Output layer
@@ -480,7 +482,7 @@ class OutlierDetections:
 
 
     def _init_detector(self):
-        """Factory to initialize outlier detector based on type"""
+        """Factory to initialize detector based on type"""
         if self.detector_type == "elliptic":
             return EllipticEnvelope(
                 contamination=self.contamination,
@@ -490,7 +492,7 @@ class OutlierDetections:
         elif self.detector_type == "ocsvm":
             return OneClassSVM(
                 kernel="rbf",
-                nu=self.contamination,  # nu ~ proportion of anomalies
+                nu=self.contamination,
                 gamma="scale"
             )
         elif self.detector_type == "iforest":
@@ -503,53 +505,41 @@ class OutlierDetections:
             raise ValueError(f"Unknown detector_type: {self.detector_type}. Supported: 'elliptic', 'ocsvm', 'iforest'")
 
     def fit(self, embeddings, labels, validation_split=0.2):
-        """
-        Train the outlier detector on embeddings (only uses real samples, ignores fake labels)
-        
-        Args:
-            embeddings: numpy array of shape (n_samples, embedding_dim)
-            labels: numpy array of shape (n_samples,) with binary labels (0=real, 1=fake)
-            validation_split: Fraction of data for validation (not used for outlier detection)
-            
-        Returns:
-            training_results: Dictionary with training metrics
-        """
+        """Train the outlier detector (modified for synthetic approaches)"""
         print(f"Training {self.detector_type} outlier detector on {embeddings.shape[0]} samples...")
         
-
-        real_embeddings = embeddings
-        
-        # Check for NaN/Inf
-        n_nan = np.isnan(real_embeddings).sum()
-        n_inf = np.isinf(real_embeddings).sum()
-        if n_nan > 0 or n_inf > 0:
-            print(f"Warning: Found {n_nan} NaN and {n_inf} Inf values in embeddings")
-        
         # Store real embeddings
-        self.real_embeddings = real_embeddings
+        self.real_embeddings = embeddings
         
         # Preprocessing
-        self.real_embeddings_scaled = self.scaler.fit_transform(real_embeddings)
+        self.real_embeddings_scaled = self.scaler.fit_transform(embeddings)
         self.real_embeddings_pca = self.pca.fit_transform(self.real_embeddings_scaled)
         
         print(f"PCA reduced shape: {self.real_embeddings_pca.shape}")
         print(f"Explained variance ratio: {self.pca.explained_variance_ratio_.sum():.3f}")
         
-        # Calculate real centroid for distance calculations
+        # Calculate real centroid
         self.real_centroid = np.mean(self.real_embeddings_pca, axis=0)
         
-        # Train outlier detector on real samples only
-        print(f"Fitting {self.detector_type} outlier detector...")
+        # Initialize detector
         self.outlier_detector = self._init_detector()
+
         self.outlier_detector.fit(self.real_embeddings_pca)
-        
-        # Evaluate on all data (including fake samples for validation)
+    # Evaluate on all data
         all_embeddings_scaled = self.scaler.transform(embeddings)
         all_embeddings_pca = self.pca.transform(all_embeddings_scaled)
         
-        # Predictions: 1 = inlier (real), -1 = outlier (fake)
-        raw_preds = self.outlier_detector.predict(all_embeddings_pca)
-        predictions = [0 if pred == 1 else 1 for pred in raw_preds]  # Convert to 0=real, 1=fake
+        # Get predictions
+        if self.detector_type.endswith('_synthetic'):
+            if self.detector_type == "neural_synthetic":
+                raw_preds = self.outlier_detector.predict(all_embeddings_pca, return_probabilities=False)
+            else:
+                raw_preds = self.outlier_detector.predict(all_embeddings_pca)
+            predictions = [0 if pred == 1 else 1 for pred in raw_preds]  # Convert to 0=real, 1=fake
+        else:
+            # Traditional one-class
+            raw_preds = self.outlier_detector.predict(all_embeddings_pca)
+            predictions = [0 if pred == 1 else 1 for pred in raw_preds]
         
         # Calculate accuracy
         train_acc = accuracy_score(labels, predictions)
@@ -557,34 +547,17 @@ class OutlierDetections:
         results = {
             'train_accuracy': train_acc,
             'n_samples': len(embeddings),
-            'n_real_samples': len(real_embeddings),
             'n_features': self.real_embeddings_pca.shape[1],
-            'n_components': self.pca.n_components_,
             'contamination': self.contamination
         }
         
         print(f"Training accuracy: {train_acc:.3f}")
-        print("Training Classification Report:")
-        print(classification_report(labels, predictions, target_names=['Real', 'Fake']))
-        
         print(f"{self.detector_type.upper()} outlier detector training completed!")
         
         return results
 
     def predict(self, embeddings, return_probabilities=True, return_distances=True):
-        """
-        Predict labels for embeddings using trained outlier detector
-        
-        Args:
-            embeddings: numpy array of shape (n_samples, embedding_dim)
-            return_probabilities: Whether to return prediction probabilities
-            return_distances: Whether to return distances to real centroid
-            
-        Returns:
-            predictions: numpy array of predictions (0=real, 1=fake)
-            probabilities: numpy array of probabilities (if requested)
-            distances: numpy array of distances to real centroid (if requested)
-        """
+        """Predict with support for both one-class and binary approaches"""
         if self.outlier_detector is None:
             raise ValueError("Detector not fitted! Call fit() first.")
         
@@ -592,26 +565,40 @@ class OutlierDetections:
         embeddings_scaled = self.scaler.transform(embeddings)
         embeddings_pca = self.pca.transform(embeddings_scaled)
         
-        # Predictions: 1 = inlier (real), -1 = outlier (fake)
-        raw_preds = self.outlier_detector.predict(embeddings_pca)
-        predictions = np.array([0 if pred == 1 else 1 for pred in raw_preds])  # Convert to 0=real, 1=fake
+        # Get predictions based on detector type
+        if self.detector_type.endswith('_synthetic'):
+            # Binary classifier trained with synthetic negatives
+            if self.detector_type == "neural_synthetic":
+                if return_probabilities:
+                    raw_preds, probabilities = self.outlier_detector.predict(embeddings_pca, return_probabilities=True)
+                else:
+                    raw_preds = self.outlier_detector.predict(embeddings_pca, return_probabilities=False)
+            else:
+                raw_preds = self.outlier_detector.predict(embeddings_pca)
+                if return_probabilities and hasattr(self.outlier_detector, 'predict_proba'):
+                    proba = self.outlier_detector.predict_proba(embeddings_pca)
+                    probabilities = proba[:, 0]  # P(outlier) = P(class 0)
+            
+            predictions = np.array([0 if pred == 1 else 1 for pred in raw_preds])  # 1->0 (real), 0->1 (fake)
+        else:
+            # Traditional one-class methods
+            raw_preds = self.outlier_detector.predict(embeddings_pca)
+            predictions = np.array([0 if pred == 1 else 1 for pred in raw_preds])
         
         results = [predictions]
         
         if return_probabilities:
-            # Get outlier scores and convert to probabilities
-            if hasattr(self.outlier_detector, "decision_function"):
-                scores = self.outlier_detector.decision_function(embeddings_pca)
-            elif hasattr(self.outlier_detector, "score_samples"):
-                scores = self.outlier_detector.score_samples(embeddings_pca)
+            if self.detector_type.endswith('_synthetic'):
+                results.append(probabilities)
             else:
-                # Fallback: use negative distance to centroid
-                distances = np.linalg.norm(embeddings_pca - self.real_centroid, axis=1)
-                scores = -distances
-            
-            # Convert scores to probabilities (higher score = more normal = lower P(fake))
-            probabilities = 1 / (1 + np.exp(scores))  # Sigmoid transformation
-            results.append(probabilities)
+                # Traditional one-class: use decision function or distances
+                if hasattr(self.outlier_detector, "decision_function"):
+                    scores = self.outlier_detector.decision_function(embeddings_pca)
+                    probabilities = 1 / (1 + np.exp(scores))  # Sigmoid
+                else:
+                    distances = np.linalg.norm(embeddings_pca - self.real_centroid, axis=1)
+                    probabilities = 1 / (1 + np.exp(-distances))  # Distance-based probability
+                results.append(probabilities)
         
         if return_distances:
             distances = np.linalg.norm(embeddings_pca - self.real_centroid, axis=1)
@@ -888,193 +875,7 @@ class OutlierDetections:
         return pair_predictions, details
 
     
-    def trajectory_metrics(self, token_embeddings):
-        """
-        Compute turning angles between successive embedding steps.
-
-        Args:
-            token_embeddings: np.ndarray of shape (num_tokens, hidden_dim)
-
-        Returns:
-            dict: trajectory features including angles, entropy, smoothness, etc.
-        """
-        if len(token_embeddings) < 3:
-            return {
-                'mean_angle': 0.0,
-                'std_angle': 0.0,
-                'angle_entropy': 0.0,
-                'trajectory_smoothness': 0.0,
-                'max_curvature': 0.0
-            }
-            
-        angles = []
-        for i in range(len(token_embeddings) - 2):
-            p1 = token_embeddings[i]
-            p2 = token_embeddings[i + 1]
-            p3 = token_embeddings[i + 2]
-
-            v1 = p2 - p1
-            v2 = p3 - p2
-
-            cos_traj = cosine_similarity(v1.reshape(1, -1), v2.reshape(1, -1))[0, 0]
-            angle = np.arccos(np.clip(cos_traj, -1.0, 1.0))  # radians in [0, π]
-
-            angles.append(angle)
-            
-        if len(angles) == 0:
-            return {
-                'mean_angle': 0.0,
-                'std_angle': 0.0,
-                'angle_entropy': 0.0,
-                'trajectory_smoothness': 0.0,
-                'max_curvature': 0.0
-            }
-            
-        hist, _ = np.histogram(angles, bins=10, density=True)
-        hist = hist + 1e-10
-
-        return {
-            'mean_angle': np.mean(angles),
-            'std_angle': np.std(angles),
-            'angle_entropy': entropy(hist),
-            'trajectory_smoothness': np.mean(np.diff(angles)) if len(angles) > 1 else 0.0,
-            'max_curvature': np.max(angles)
-        }
-
-    def visualize_manifold(self, df_train, df_train_gt, extractor_model, target_layer=-2, n_samples=20, n_components=0.95):
-        """
-        Visualize PCA manifold of real vs fake texts.
-
-        Args:
-            df_train: dataframe with 'id', 'file_1', 'file_2'
-            df_train_gt: dataframe with 'id', 'real_text_id'
-            extractor_model: embedding extractor
-            target_layer: which transformer layer to extract
-            n_samples: number of fake texts to plot
-            n_components: number of PCA components
-        """
-        # Merge training data with ground truth labels
-        df_merged = df_train.merge(df_train_gt, on='id')
-
-        # Select real and fake texts
-        real_texts = [
-            row['file_1'] if row['real_text_id'] == 1 else row['file_2']
-            for idx, row in df_merged.iterrows()
-        ]
-        fake_texts = [
-            row['file_2'] if row['real_text_id'] == 1 else row['file_1']
-            for idx, row in df_merged.iterrows()
-        ]
-
-        # --- Compute embeddings for real texts ---
-        #layer_embeds_real = extractor_model.get_all_layer_embeddings(real_texts, pooling='mean')
-        layer_embeds_real = extractor_model._get_all_token_embeddings(real_texts, batch_size=32)
-
-        print(layer_embeds_real)
-        size = len(real_texts)
-        size =4000
-        real_embeddings = np.array([layer_embeds_real[target_layer][i] for i in range(size)])
-
-        # Standardize + PCA
-        print(real_embeddings.shape)
-        scaler = StandardScaler()
-        real_embeddings_scaled = scaler.fit_transform(real_embeddings)
-
-        pca = PCA(n_components=n_components)
-        real_embeddings_pca = pca.fit_transform(real_embeddings_scaled)
-        real_centroid = np.mean(real_embeddings_pca, axis=0)
-
-        # --- Compute embeddings for fake texts (subset for plotting) ---
-        #layer_embeds_fake = extractor_model.get_all_layer_embeddings(fake_texts[:n_samples], pooling='mean')
-        layer_embeds_fake = extractor_model._get_all_token_embeddings(fake_texts, batch_size=32)
-
-
-        #size = len(fake_texts)
-  
-        fake_embeddings = np.array([layer_embeds_fake[target_layer][i] for i in range(size)])
-        #fake_embeddings = np.array([layer_embeds_fake[target_layer][i] for i in range(len(fake_texts[:n_samples]))])
-        fake_embeddings_scaled = scaler.transform(fake_embeddings)  # use same scaler
-        fake_embeddings_pca = pca.transform(fake_embeddings_scaled)  # use same PCA
-
-        # --- Plot ---
-        plt.figure(figsize=(12, 8))
-        plt.scatter(real_embeddings_pca[:, 0], real_embeddings_pca[:, 1],
-                    alpha=0.6, c='green', label='Real Texts', s=50)
-        plt.scatter(real_centroid[0], real_centroid[1],
-                    c='red', s=200, marker='*', label='Real Centroid')
-        plt.scatter(fake_embeddings_pca[:, 0], fake_embeddings_pca[:, 1],
-                    alpha=0.6, c='orange', label='Fake Texts', s=50)
-
-        plt.xlabel('PCA Component 1')
-        plt.ylabel('PCA Component 2')
-        plt.title(f'Real vs Fake Text Manifold (Layer {target_layer})')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.show()
-       
-
-
-    def plot_angle_distributions(self, df_train, df_train_gt, extractor_model, target_layer=-2):
-        """
-        Plot trajectory angle distributions for real vs fake texts 
-        in a dataframe of text pairs.
-
-        Args:
-            df_train: pd.DataFrame with ['file_1', 'file_2']
-            df_train_gt: pd.DataFrame with ['real_text_id'] (1 or 2)
-            extractor_model: embedding extractor
-            target_layer: which transformer layer to use
-        """
-        all_data = []
-
-        df_merged = df_train.merge(df_train_gt, on='id')
-
-
-        real_text = [
-                    row['file_1'] if row['real_text_id'] == 1 else row['file_2']
-                    for idx, row in df_merged.iterrows()
-                ]
-        fake_text = [
-                    row['file_2'] if row['real_text_id'] == 1 else row['file_1']
-                    for idx, row in df_merged.iterrows()
-                ]
-
-        # --- Real text ---
-        layer_embeds_real = extractor_model.get_all_layer_embeddings(
-            real_text, pooling="all"
-        )
-
-        token_embeds_real = layer_embeds_real[target_layer]
-        real_angles = self.trajectory_metrics(token_embeds_real)
-
-        for angle in real_angles:
-            all_data.append({"label": "Real", "angle": angle})
-
-        # --- Fake text ---
-        layer_embeds_fake = extractor_model.get_all_layer_embeddings(
-            fake_text, pooling="all"
-        )
-        print(layer_embeds_fake)
-        token_embeds_fake = layer_embeds_fake[target_layer]
-        fake_angles = self.trajectory_metrics(token_embeds_fake)
-
-        for angle in fake_angles:
-            all_data.append({"label": "Fake", "angle": angle})
-
-        df_plot = pd.DataFrame(all_data)
-        if df_plot.empty:
-            print("No angle data collected. Check your inputs.")
-            return
-
-        plt.figure(figsize=(10, 6))
-        sns.violinplot(data=df_plot, x="label", y="angle", cut=0, inner="quartile")
-        plt.title(f"Distribution of trajectory angles at layer {target_layer}")
-        plt.ylabel("Angle (radians)")
-        plt.xlabel("Text Type")
-        plt.grid(True, alpha=0.3)
-        plt.show()
-
-
+    
 class TrajectoryClassifier:
     """
     A standalone classifier that uses trajectory metrics from token embeddings
