@@ -20,6 +20,45 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def extract_training_data(train_dataloader, max_samples=None):
+    """
+    Extract training data from unified DataLoader
+    
+    Args:
+        train_dataloader: Unified DataLoader
+        max_samples: Maximum samples to extract (None for all)
+    
+    Returns:
+        all_texts: List of texts
+        all_labels: List of binary labels (0=real, 1=fake)
+    """
+    print("Extracting training data from unified DataLoader...")
+    
+    all_texts = []
+    all_labels = []
+    sample_count = 0
+    
+    for batch_idx, batch in enumerate(train_dataloader):
+        batch_texts = batch['text']
+        batch_labels = batch['label'].tolist()
+        
+        all_texts.extend(batch_texts)
+        all_labels.extend(batch_labels)
+        sample_count += len(batch_texts)
+        
+        if max_samples and sample_count >= max_samples:
+            break
+    
+    # Limit to max_samples if specified
+    if max_samples:
+        all_texts = all_texts[:max_samples]
+        all_labels = all_labels[:max_samples]
+    
+    print(f"Extracted {len(all_texts)} texts")
+    print(f"Label distribution: {np.bincount(all_labels)} (0=real, 1=fake)")
+    
+    return all_texts, all_labels
+
 class UnifiedTextDataset(Dataset):
     """
     Unified Dataset where each text is a separate sample with binary label.
@@ -264,6 +303,7 @@ def collate_unified_texts(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Custom collate function for unified text batches.
     
+    stay general
     Args:
         batch: List of samples from UnifiedTextDataset
         
@@ -271,23 +311,44 @@ def collate_unified_texts(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         Batched dictionary with lists/tensors of data
     """
     collated = {
-        'sample_ids': [sample['sample_id'] for sample in batch],
-        'texts': [sample['text'] for sample in batch],
-        'pair_ids': torch.tensor([sample['pair_id'] for sample in batch], dtype=torch.long),
-        'text_positions': torch.tensor([sample['text_position'] for sample in batch], dtype=torch.long),
+        'text': [sample['text'] for sample in batch],
     }
     
     # Add labels if present in any sample
     if 'label' in batch[0]:
-        collated['labels'] = torch.tensor([sample['label'] for sample in batch], dtype=torch.long)
+        collated['label'] = torch.tensor([sample['label'] for sample in batch], dtype=torch.long)
     
+    # case of dataset from real or fake
+    if 'sample_id' in batch[0]:
+        collated['sample_id'] = [sample['sample_id'] for sample in batch]
+        collated['pair_id'] = torch.tensor([sample['pair_id'] for sample in batch], dtype=torch.long)
+        collated['text_position'] = torch.tensor([sample['text_position'] for sample in batch], dtype=torch.long)
+
     # Add metadata if present
     if 'text_length' in batch[0]:
-        collated['text_lengths'] = torch.tensor([sample['text_length'] for sample in batch], dtype=torch.long)
-        collated['char_lengths'] = torch.tensor([sample['char_length'] for sample in batch], dtype=torch.long)
+        collated['text_length'] = torch.tensor([sample['text_length'] for sample in batch], dtype=torch.long)
+        collated['char_length'] = torch.tensor([sample['char_length'] for sample in batch], dtype=torch.long)
     
     return collated
 
+class LargeCSVDataset(Dataset):
+    def __init__(self, csv_path, text_col="text", label_col="label", indices=None):
+        self.csv_path = csv_path
+        self.text_col = text_col
+        self.label_col = label_col
+        self.df = pd.read_csv(csv_path, usecols=[text_col, label_col])
+        if indices is not None:
+            self.df = self.df.iloc[indices].reset_index(drop=True)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        return {
+            "text": row[self.text_col],
+            "label": row[self.label_col]
+        }
 
 def create_unified_dataloaders(
     train_path: Optional[str] = None,
@@ -376,6 +437,66 @@ def create_unified_dataloaders(
         logger.info(f"Created unified test DataLoader: {len(test_dataset)} samples")
     
     return train_dataloader, test_dataloader
+
+def get_text_dataloader(
+    data_source,
+    dataset_type="csv",
+    batch_size=32,
+    shuffle=True,
+    num_workers=4,
+    text_col="text",
+    label_col="label",
+    indices=None,
+    **kwargs
+):
+    """
+    Returns a DataLoader for either a flat CSV or paired text directory.
+
+    Args:
+        data_source: Path to CSV file or directory (or DataFrame for paired)
+        dataset_type: "csv" for flat CSV, "paired" for paired text directory
+        batch_size: Batch size
+        shuffle: Shuffle data
+        num_workers: DataLoader workers
+        text_col: Column name for text (CSV)
+        label_col: Column name for label (CSV)
+        indices: Optional indices for splitting (CSV)
+        **kwargs: Other args for UnifiedTextDataset
+
+    Returns:
+        DataLoader
+    """
+    if dataset_type == "csv":
+        dataset = LargeCSVDataset(
+            csv_path=data_source,
+            text_col=text_col,
+            label_col=label_col,
+            indices=indices
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers
+        )
+    elif dataset_type == "paired":
+        dataset = UnifiedTextDataset(
+            data_path=data_source if isinstance(data_source, str) else None,
+            dataframe=data_source if isinstance(data_source, pd.DataFrame) else None,
+            **kwargs
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            collate_fn=collate_unified_texts,
+            pin_memory=torch.cuda.is_available(),
+        )
+    else:
+        raise ValueError("dataset_type must be 'csv' or 'paired'")
+    return loader
+
 
 
 def extract_real_fake_texts(
@@ -520,4 +641,24 @@ def test_unified_dataloader():
 
 
 if __name__ == "__main__":
-    test_unified_dataloader()
+    #test_unified_dataloader()
+
+    data_human_ai='/home/infres/billy-22/projets/esa_challenge_kaggle/deepfake-text-detector/data_human/AI_Human.csv'
+
+    from sklearn.model_selection import train_test_split
+
+    # Load indices for train/val split (efficient, doesn't load all data at once)
+    df = pd.read_csv(data_human_ai, usecols=["text", "generated"])
+    train_idx, val_idx = train_test_split(df.index, test_size=0.2, stratify=df["generated"], random_state=42)
+
+    # Create datasets
+    train_loader = get_text_dataloader(
+        data_source=data_human_ai,
+        dataset_type="csv",
+        batch_size=32,
+        shuffle=True,
+        indices=train_idx,
+        text_col="text",
+        label_col="generated"
+    )
+   
