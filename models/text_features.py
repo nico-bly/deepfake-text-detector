@@ -10,60 +10,51 @@ from threading import Thread
 from transformers import AutoModelForCausalLM
 
 #### --------------------------------------------- computes perplexity --------------------------------------------
-
 class PerplexityCalculator:
-    """
-    Calculate perplexity for text using causal language models.
-    Text -> Perplexity computation -> scores
-
-    """
-    
     def __init__(self, model_name="gpt2", device=None):
-        """
-        Initialize perplexity calculator
-        Args:
-            model_name: HuggingFace model (gpt2, gpt2-medium, gpt2-large, gpt2-xl)
-            device: cuda or cpu
-        """
+        """Use actual causal LMs for perplexity"""
         self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Loading {model_name} on {self.device}...")
         
+        # Ensure we're using a causal LM
+        causal_models = ["gpt2", "Qwen/Qwen2.5-0.5B", "microsoft/DialoGPT-medium"]
+        if not any(cm in model_name for cm in causal_models):
+            print(f"Warning: {model_name} might not be a causal LM")
+        
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name)  # FIXED!
-        self.model.to(self.device)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name, 
+            torch_dtype=torch.float16,  # Use half precision
+            device_map=self.device
+        )
         self.model.eval()
         
-        # Set padding token
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-    
+
     def calculate_perplexity(self, text: str, max_length: int = 512) -> float:
-        """
-        Calculate perplexity for a single text
-        Args:
-            text: input text string
-            max_length: maximum token length
-        Returns:
-            perplexity: float value (lower = more predictable/fluent)
-        """
-        # Tokenize
+        """Sanitize input and handle edge cases"""
+        # Sanitize empty text (following your conventions)
+        if not text or not text.strip():
+            text = " "
+        
         encodings = self.tokenizer(
             text,
             return_tensors='pt',
             truncation=True,
             max_length=max_length
         )
-        input_ids = encodings['input_ids'].to(self.device).long()
+        input_ids = encodings['input_ids'].to(self.device)
         
-        # Calculate loss
+        # Skip if too short
+        if input_ids.shape[1] < 2:
+            return float('inf')
+        
         with torch.no_grad():
             outputs = self.model(input_ids, labels=input_ids)
             loss = outputs.loss.item()
+        return np.exp(loss)
         
-        # Perplexity = exp(loss)
-        perplexity = np.exp(loss)
-        return perplexity
-    
     def calculate_perplexity_sliding_window(
         self, 
         text: str, 
@@ -203,24 +194,13 @@ class TextIntrinsicDimensionCalculator:
         """Preprocess text (following the original implementation)."""
         return text.replace('\n', ' ').replace('  ', ' ')
     
-    def _get_token_embeddings(
-        self,
-        text: str,
-        max_length: int = 512,
-        layer_idx: Optional[int] = None
-    ) -> np.ndarray:
-        """
-        Get token-level embeddings for a single text.
-        
-        Args:
-            text: Single text string
-            max_length: Maximum token length
+    def _get_token_embeddings(self, text: str, max_length: int = 512, 
+                             layer_idx: Optional[int] = None) -> np.ndarray:
+        """Handle different model architectures"""
+        # Sanitize input
+        if not text or not text.strip():
+            text = " "
             
-        Returns:
-            embeddings: numpy array of shape (n_tokens, embedding_dim)
-                       Excludes special tokens (CLS, SEP)
-        """
-        # Preprocess and tokenize
         processed_text = self.preprocess_text(text)
         inputs = self.tokenizer(
             processed_text,
@@ -232,7 +212,6 @@ class TextIntrinsicDimensionCalculator:
         input_ids = inputs['input_ids'].to(self.device)
         attention_mask = inputs['attention_mask'].to(self.device)
         
-        # Get embeddings
         with torch.no_grad():
             outputs = self.model(
                 input_ids=input_ids,
@@ -241,23 +220,24 @@ class TextIntrinsicDimensionCalculator:
             )
 
             target_layer_idx = self.layer_idx if layer_idx is None else layer_idx
-
             if target_layer_idx is None:
                 token_embeddings = outputs.last_hidden_state[0].cpu().numpy()
             else:
                 hidden_states = outputs.hidden_states
                 layer_count = len(hidden_states)
-                # Support negative indexing (e.g., -1 for last layer)
                 target_idx = target_layer_idx if target_layer_idx >= 0 else layer_count + target_layer_idx
-                if target_idx < 0 or target_idx >= layer_count:
-                    raise ValueError(
-                        f"layer_idx {target_layer_idx} is out of range for model with {layer_count} layers"
-                    )
                 token_embeddings = hidden_states[target_idx][0].cpu().numpy()
         
-        # Omit first and last tokens (CLS and SEP)
-        # They don't directly correspond to text content
-        token_embeddings = token_embeddings[1:-1]
+        # Smart token filtering based on model type
+        if 'bert' in self.tokenizer.__class__.__name__.lower():
+            # BERT-style: remove CLS and SEP
+            token_embeddings = token_embeddings[1:-1]
+        elif 'gpt' in self.tokenizer.__class__.__name__.lower():
+            # GPT-style: keep all tokens
+            pass
+        else:
+            # Default: remove first token only (often CLS)
+            token_embeddings = token_embeddings[1:]
         
         return token_embeddings
     
