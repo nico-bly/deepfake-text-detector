@@ -31,84 +31,117 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
 class NeuralClassifier(nn.Module):
-    def __init__(self, input_dim=4096, hidden_dims=[1024, 512], dropout_rate=0.2):
+    def __init__(self, input_dim=4096, hidden_dims=[1024, 512], dropout_rate=0.2, normalization="layernorm"):
+        """Simple MLP for binary classification.
+
+        Replaces BatchNorm with LayerNorm by default to avoid crashes when the
+        final mini-batch has size 1 (BatchNorm requires >=2 samples to compute
+        variance during training). If you explicitly want BatchNorm you can set
+        normalization="batchnorm", but LayerNorm is typically safer for smaller
+        or uneven batch sizes.
+        """
         super().__init__()
         self.layers = nn.ModuleList()
-        
-        # Input layer
+        self.normalization = normalization.lower()
+
+        def norm_layer(dim):
+            if self.normalization == "batchnorm":
+                return nn.BatchNorm1d(dim)
+            elif self.normalization == "layernorm":
+                return nn.LayerNorm(dim)
+            else:
+                return nn.Identity()
+
+        # Input layer block
         self.layers.append(nn.Linear(input_dim, hidden_dims[0]))
-        self.layers.append(nn.BatchNorm1d(hidden_dims[0]))  # Batch Normalization
-        self.layers.append(nn.ReLU())  # Changed to ReLU
+        self.layers.append(norm_layer(hidden_dims[0]))
+        self.layers.append(nn.ReLU())
         self.layers.append(nn.Dropout(dropout_rate))
-        
-        # Hidden layers
-        for i in range(len(hidden_dims)-1):
-            self.layers.append(nn.Linear(hidden_dims[i], hidden_dims[i+1]))
-            self.layers.append(nn.BatchNorm1d(hidden_dims[i+1]))  # Batch Normalization
-            self.layers.append(nn.ReLU())  # Changed to ReLU
+
+        # Hidden layer blocks
+        for i in range(len(hidden_dims) - 1):
+            self.layers.append(nn.Linear(hidden_dims[i], hidden_dims[i + 1]))
+            self.layers.append(norm_layer(hidden_dims[i + 1]))
+            self.layers.append(nn.ReLU())
             self.layers.append(nn.Dropout(dropout_rate))
-            
+
         # Output layer
         self.layers.append(nn.Linear(hidden_dims[-1], 1))
         self.layers.append(nn.Sigmoid())
-        
+
     def forward(self, x):
         for layer in self.layers:
-            x = layer(x)
+            # If using BatchNorm and batch size == 1, temporarily switch to eval to avoid error
+            if isinstance(layer, nn.BatchNorm1d) and x.size(0) == 1 and self.training:
+                layer.eval()
+                x = layer(x)
+                layer.train()  # restore
+            else:
+                x = layer(x)
         return x
 
 class DeepBinaryDetector:
-    def __init__(self, input_dim=4096, hidden_dims=[1024, 512], device='cuda'):
+    def __init__(self, input_dim=4096, hidden_dims=[1024, 512], device='cuda', normalization="layernorm"):
         self.device = device
-        self.model = NeuralClassifier(input_dim, hidden_dims).to(device)
+        self.model = NeuralClassifier(input_dim, hidden_dims, normalization=normalization).to(device)
         self.scaler = StandardScaler()
         self._is_fitted = False
-        
-    def fit(self, embeddings, labels, validation_split=0.2, 
-        epochs=10, batch_size=32, lr=0.001):
-        # Preprocess
+
+    def fit(self, embeddings, labels, validation_split=0.2, epochs=10, batch_size=32, lr=0.001, X_val=None, y_val=None):
+        """Train neural network.
+
+        If external validation tensors X_val/y_val are provided they are used; otherwise
+        a split is created when validation_split>0.
+        """
+        # Scale features
         embeddings = self.scaler.fit_transform(embeddings)
-        # Move data to CPU before splitting
         if isinstance(labels, torch.Tensor):
             labels = labels.cpu().numpy()
-        
+
         X = torch.FloatTensor(embeddings)
         y = torch.FloatTensor(labels)
-        
-        # Train/val split on CPU
-        if validation_split > 0:
-            X_train, X_val, y_train, y_val = train_test_split(
-                X.cpu().numpy(), y.cpu().numpy(), 
-                test_size=validation_split, 
+
+        # Perform internal split only if external not provided
+        if X_val is None and validation_split > 0:
+            X_train_np, X_val_np, y_train_np, y_val_np = train_test_split(
+                X.cpu().numpy(), y.cpu().numpy(),
+                test_size=validation_split,
                 stratify=y.cpu().numpy()
             )
-            # Convert back to tensors and move to device
-            X_train = torch.FloatTensor(X_train).to(self.device)
-            X_val = torch.FloatTensor(X_val).to(self.device)
-            y_train = torch.FloatTensor(y_train).to(self.device)
-            y_val = torch.FloatTensor(y_val).to(self.device)
+            X_train = torch.FloatTensor(X_train_np).to(self.device)
+            X_val = torch.FloatTensor(X_val_np).to(self.device)
+            y_train = torch.FloatTensor(y_train_np).to(self.device)
+            y_val = torch.FloatTensor(y_val_np).to(self.device)
         else:
-            X_train, y_train = X.to(self.device), y.to(self.device)
-            X_val, y_val = None, None
-            
-        # Create dataloaders
+            # Use provided validation or none
+            X_train = X.to(self.device)
+            y_train = y.to(self.device)
+            if X_val is not None and isinstance(X_val, np.ndarray):
+                X_val = torch.FloatTensor(X_val).to(self.device)
+            if y_val is not None and isinstance(y_val, np.ndarray):
+                y_val = torch.FloatTensor(y_val).to(self.device)
+            if X_val is not None and isinstance(X_val, torch.Tensor):
+                # Ensure correct device
+                X_val = X_val.to(self.device)
+            if y_val is not None and isinstance(y_val, torch.Tensor):
+                y_val = y_val.to(self.device)
+
+        # DataLoaders
         train_dataset = TensorDataset(X_train, y_train.view(-1, 1))
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
         if X_val is not None:
             val_dataset = TensorDataset(X_val, y_val.view(-1, 1))
             val_loader = DataLoader(val_dataset, batch_size=batch_size)
-        
-        # Training setup
+
         criterion = nn.BCELoss()
         optimizer = optim.Adam(self.model.parameters(), lr=lr)
         best_val_loss = float('inf')
         best_model = None
-        
-        # Training loop
+        val_acc = None
+
         for epoch in range(epochs):
             self.model.train()
-            train_loss = 0
+            train_loss = 0.0
             for batch_X, batch_y in train_loader:
                 optimizer.zero_grad()
                 outputs = self.model(batch_X)
@@ -116,36 +149,31 @@ class DeepBinaryDetector:
                 loss.backward()
                 optimizer.step()
                 train_loss += loss.item()
-            
-            # Validation
+
             if X_val is not None:
                 self.model.eval()
-                val_loss = 0
+                val_loss = 0.0
                 val_preds = []
                 val_true = []
-                
                 with torch.no_grad():
                     for batch_X, batch_y in val_loader:
                         outputs = self.model(batch_X)
-                        val_loss += criterion(outputs, batch_y).item()
+                        loss = criterion(outputs, batch_y)
+                        val_loss += loss.item()
                         val_preds.extend((outputs > 0.5).cpu().numpy())
                         val_true.extend(batch_y.cpu().numpy())
-                
+                val_loss /= len(val_loader)
                 val_acc = accuracy_score(val_true, val_preds)
-                print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss/len(train_loader):.4f}, '
-                      f'Val Loss: {val_loss/len(val_loader):.4f}, Val Acc: {val_acc:.4f}')
-                
-                # Save best model
+                print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss/len(train_loader):.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}')
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_model = copy.deepcopy(self.model.state_dict())
-            
-        # Load best model
+
         if best_model is not None:
             self.model.load_state_dict(best_model)
-        
+
         self._is_fitted = True
-        return {'val_accuracy': val_acc if X_val is not None else None}
+        return {'val_accuracy': val_acc}
     
     def predict(self, embeddings, return_probabilities=True):
         """
@@ -302,16 +330,26 @@ class BinaryDetector:
         
         # Handle neural network training separately
         if classifier_type == "neural":
-            training_results = self.classifier.fit(
-                X_train, y_train, 
-                validation_split=validation_split if X_val is None else 0.0,
-                epochs=10, 
-                batch_size=32, 
-                lr=0.001
-            )
+            # If we already created a validation split (X_val not None), pass it directly
+            if X_val is not None:
+                training_results = self.classifier.fit(
+                    X_train, y_train,
+                    validation_split=0.0,  # external provided
+                    epochs=10,
+                    batch_size=32,
+                    lr=0.001,
+                    X_val=X_val,
+                    y_val=y_val
+                )
+            else:
+                training_results = self.classifier.fit(
+                    X_train, y_train,
+                    validation_split=validation_split,
+                    epochs=10,
+                    batch_size=32,
+                    lr=0.001
+                )
             val_acc = training_results.get('val_accuracy')
-            
-            # Get training predictions (neural network returns tuple)
             train_pred = self.classifier.predict(X_train, return_probabilities=False)
         else:
             # Standard sklearn-style classifiers
@@ -505,55 +543,77 @@ class OutlierDetections:
             raise ValueError(f"Unknown detector_type: {self.detector_type}. Supported: 'elliptic', 'ocsvm', 'iforest'")
 
     def fit(self, embeddings, labels, validation_split=0.2):
-        """Train the outlier detector (modified for synthetic approaches)"""
-        print(f"Training {self.detector_type} outlier detector on {embeddings.shape[0]} samples...")
-        
-        # Store real embeddings
-        self.real_embeddings = embeddings
-        
-        # Preprocessing
-        self.real_embeddings_scaled = self.scaler.fit_transform(embeddings)
+        """Train the outlier detector with optional validation split.
+
+        Notes:
+        - Scaler/PCA are fit on the training split only to avoid leakage.
+        - Detector is trained on the training split and evaluated on both train and val (if provided).
+        """
+        n_samples = embeddings.shape[0]
+        print(f"Training {self.detector_type} outlier detector on {n_samples} samples...")
+
+        # Prepare split
+        do_split = validation_split and validation_split > 0 and n_samples > 50 and labels is not None
+        if do_split:
+            try:
+                X_train, X_val, y_train, y_val = train_test_split(
+                    embeddings, labels,
+                    test_size=validation_split,
+                    random_state=self.random_state,
+                    stratify=labels if len(np.unique(labels)) > 1 else None
+                )
+            except Exception:
+                # Fallback without stratify if labels are degenerate
+                X_train, X_val, y_train, y_val = train_test_split(
+                    embeddings, labels,
+                    test_size=validation_split,
+                    random_state=self.random_state
+                )
+        else:
+            X_train, y_train = embeddings, labels
+            X_val, y_val = None, None
+
+        # Fit scaler/PCA on training only
+        self.real_embeddings = X_train
+        self.real_embeddings_scaled = self.scaler.fit_transform(X_train)
         self.real_embeddings_pca = self.pca.fit_transform(self.real_embeddings_scaled)
-        
+
         print(f"PCA reduced shape: {self.real_embeddings_pca.shape}")
         print(f"Explained variance ratio: {self.pca.explained_variance_ratio_.sum():.3f}")
-        
-        # Calculate real centroid
-        self.real_centroid = np.mean(self.real_embeddings_pca, axis=0)
-        
-        # Initialize detector
-        self.outlier_detector = self._init_detector()
 
+        # Centroid on train
+        self.real_centroid = np.mean(self.real_embeddings_pca, axis=0)
+
+        # Initialize and fit detector on train
+        self.outlier_detector = self._init_detector()
         self.outlier_detector.fit(self.real_embeddings_pca)
-    # Evaluate on all data
-        all_embeddings_scaled = self.scaler.transform(embeddings)
-        all_embeddings_pca = self.pca.transform(all_embeddings_scaled)
-        
-        # Get predictions
-        if self.detector_type.endswith('_synthetic'):
-            if self.detector_type == "neural_synthetic":
-                raw_preds = self.outlier_detector.predict(all_embeddings_pca, return_probabilities=False)
-            else:
-                raw_preds = self.outlier_detector.predict(all_embeddings_pca)
-            predictions = [0 if pred == 1 else 1 for pred in raw_preds]  # Convert to 0=real, 1=fake
-        else:
-            # Traditional one-class
-            raw_preds = self.outlier_detector.predict(all_embeddings_pca)
-            predictions = [0 if pred == 1 else 1 for pred in raw_preds]
-        
-        # Calculate accuracy
-        train_acc = accuracy_score(labels, predictions)
-        
+
+        # Train predictions/accuracy
+        train_raw_preds = self.outlier_detector.predict(self.real_embeddings_pca)
+        train_predictions = np.array([0 if pred == 1 else 1 for pred in train_raw_preds])
+        train_acc = accuracy_score(y_train, train_predictions) if y_train is not None else None
+
         results = {
             'train_accuracy': train_acc,
-            'n_samples': len(embeddings),
+            'n_samples': n_samples,
             'n_features': self.real_embeddings_pca.shape[1],
             'contamination': self.contamination
         }
-        
-        print(f"Training accuracy: {train_acc:.3f}")
+
+        # Validation evaluation (transform with train scaler/PCA)
+        if X_val is not None:
+            X_val_scaled = self.scaler.transform(X_val)
+            X_val_pca = self.pca.transform(X_val_scaled)
+            val_raw_preds = self.outlier_detector.predict(X_val_pca)
+            val_predictions = np.array([0 if pred == 1 else 1 for pred in val_raw_preds])
+            val_acc = accuracy_score(y_val, val_predictions)
+            results['val_accuracy'] = val_acc
+            print(f"Training accuracy: {train_acc:.3f} | Validation accuracy: {val_acc:.3f}")
+        else:
+            print(f"Training accuracy: {train_acc:.3f}")
+
         print(f"{self.detector_type.upper()} outlier detector training completed!")
-        
+
         return results
 
     def predict(self, embeddings, return_probabilities=True, return_distances=True):
@@ -591,13 +651,14 @@ class OutlierDetections:
             if self.detector_type.endswith('_synthetic'):
                 results.append(probabilities)
             else:
-                # Traditional one-class: use decision function or distances
+                # Traditional one-class: use decision function or distances -> convert to P(fake)
                 if hasattr(self.outlier_detector, "decision_function"):
                     scores = self.outlier_detector.decision_function(embeddings_pca)
-                    probabilities = 1 / (1 + np.exp(scores))  # Sigmoid
+                    # Stable sigmoid: higher score (more normal) -> lower P(fake)
+                    probabilities = 1.0 / (1.0 + np.exp(np.clip(scores, -50, 50)))
                 else:
                     distances = np.linalg.norm(embeddings_pca - self.real_centroid, axis=1)
-                    probabilities = 1 / (1 + np.exp(-distances))  # Distance-based probability
+                    probabilities = 1.0 / (1.0 + np.exp(-np.clip(distances, -50, 50)))
                 results.append(probabilities)
         
         if return_distances:
@@ -606,9 +667,9 @@ class OutlierDetections:
         
         return results if len(results) > 1 else results[0]
 
-    def predict_pairs(self, embeddings_1, embeddings_2):
+    def predict_pairs_from_embeddings(self, embeddings_1, embeddings_2):
         """
-        Predict which embedding in each pair is real using outlier detection
+        Predict which embedding in each pair is real using outlier detection (embeddings API).
         
         Args:
             embeddings_1: embeddings for first items in pairs

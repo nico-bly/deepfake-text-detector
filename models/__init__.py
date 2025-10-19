@@ -8,10 +8,13 @@ Contains the main implementation modules:
 
 from .extractors import EmbeddingExtractor
 from .classifiers import OutlierDetections, TrajectoryClassifier, BinaryDetector
+from .text_features import TextIntrinsicDimensionCalculator, PerplexityCalculator
 
 __all__ = [
     "EmbeddingExtractor",
     "OutlierDetections", 
     "TrajectoryClassifier",
     "BinaryDetector",
+    "PerplexityCalculator",
+    "TextIntrinsicDimensionCalculator"
 ]

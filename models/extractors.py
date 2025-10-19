@@ -1,6 +1,8 @@
 from typing import Dict, List, Union
 import numpy as np
 import torch
+import os
+import psutil
 from transformers import AutoTokenizer, AutoModel
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -12,11 +14,13 @@ class EmbeddingExtractor(torch.nn.Module):
     outputs is a a vector for each text
     """
 
-    def __init__(self, model_name="distilbert-base-uncased", device=None, use_flash_attention=False, is_qwen3=None):
+    def __init__(self, model_name="distilbert-base-uncased", device=None, use_flash_attention=False, is_qwen3=None, log_memory: bool = False, memory_interval: int = 1):
         super().__init__()
         
         self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
+        self.log_memory = log_memory
+        self.memory_interval = max(1, memory_interval)
 
         if is_qwen3 is None:
             self.is_qwen3 = 'qwen3' in model_name.lower() and 'embedding' in model_name.lower()
@@ -28,19 +32,22 @@ class EmbeddingExtractor(torch.nn.Module):
         print(f"Loading model: {model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side=padding_side)
 
+        # Force use of safetensors to bypass PyTorch 2.6 security requirement
         if use_flash_attention and self.device == 'cuda':
             print("Loading with Flash Attention 2...")
             self.model = AutoModel.from_pretrained(
                 model_name,
                 torch_dtype=torch.float16,
                 attn_implementation="flash_attention_2",
-                device_map=None
+                device_map=None,
+                use_safetensors=True
             )
         else:
             self.model = AutoModel.from_pretrained(
                 model_name,
                 torch_dtype=torch.float16,
-                device_map=None
+                device_map=None,
+                use_safetensors=True
             )
         
         self.model = self.model.to(self.device)
@@ -103,7 +110,7 @@ class EmbeddingExtractor(torch.nn.Module):
         iterator = range(0, len(texts), batch_size)
         if show_progress and len(texts) > batch_size:
             iterator = tqdm(iterator, desc="Extracting embeddings")
-        for i in iterator:
+        for batch_index, i in enumerate(iterator):
             batch = texts[i:i+batch_size]
             model_inputs = self.tokenizer(
                 batch,
@@ -116,6 +123,10 @@ class EmbeddingExtractor(torch.nn.Module):
             model_inputs = {k: v.to(self.device) for k, v in model_inputs.items()}
             with torch.no_grad():
                 outputs = self.model(**model_inputs, output_hidden_states=True)
+
+            # Memory logging (GPU + CPU) after forward pass
+            if self.log_memory and (batch_index % self.memory_interval == 0):
+                self._log_memory_usage(batch_index, len(batch), model_inputs)
 
             attention_mask = model_inputs['attention_mask']
             
@@ -140,6 +151,197 @@ class EmbeddingExtractor(torch.nn.Module):
 
         assert len(all_texts_embeddings) == len(texts)
         return all_texts_embeddings
+
+    def _log_memory_usage(self, batch_index: int, batch_size: int, model_inputs: Dict[str, torch.Tensor]):
+        """Log current memory usage (GPU + CPU) and approximate tensor footprint for embeddings.
+        Args:
+            batch_index: index of current batch
+            batch_size: number of texts in batch
+            model_inputs: tokenized input tensors
+        """
+        # CPU memory
+        process = psutil.Process(os.getpid())
+        rss_gb = process.memory_info().rss / (1024 ** 3)
+
+        gpu_mem = None
+        max_gpu = None
+        if torch.cuda.is_available() and 'cuda' in str(self.device):
+            try:
+                device_index = torch.device(self.device).index or 0
+                gpu_mem = torch.cuda.memory_allocated(device_index) / (1024 ** 3)
+                max_gpu = torch.cuda.max_memory_allocated(device_index) / (1024 ** 3)
+            except Exception:
+                pass
+
+        # Estimate current hidden states footprint (they are on device in outputs.hidden_states)
+        hidden_states_bytes = 0
+        try:
+            for hs in self.model._last_output.hidden_states:  # Not standard; fallback below if fails
+                hidden_states_bytes += hs.element_size() * hs.nelement()
+        except Exception:
+            # We don't have stored hidden states; just approximate using embedding dim * seq len * layers
+            try:
+                seq_len = int(model_inputs['input_ids'].shape[1])
+                layers = int(self.model.config.num_hidden_layers + 1)  # + embedding layer
+                hidden_dim = int(self.model.config.hidden_size)
+                dtype_size = torch.tensor([], dtype=torch.float16).element_size()
+                hidden_states_bytes = seq_len * layers * hidden_dim * batch_size * dtype_size
+            except Exception:
+                hidden_states_bytes = 0
+
+        hidden_states_gb = hidden_states_bytes / (1024 ** 3)
+
+        msg = f"[Memory] Batch {batch_index} | batch_size={batch_size} | CPU RSS={rss_gb:.2f} GB"
+        if gpu_mem is not None:
+            msg += f" | GPU alloc={gpu_mem:.2f} GB (max {max_gpu:.2f} GB)"
+        msg += f" | approx hidden_states={hidden_states_gb:.2f} GB"
+        print(msg)
+
+    # ---------------- Memory efficient single-layer pooled extraction -----------------
+    def get_pooled_layer_embeddings(
+        self,
+        texts: Union[str, List[str]],
+        layer_idx: int,
+        pooling: str = "mean",
+        batch_size: int = 16,
+        max_length: int = 8192,
+        show_progress: bool = True,
+        return_attention: bool = False,
+    ) -> Union[np.ndarray, tuple]:
+        """Return pooled embeddings for a single layer without storing all layers.
+
+        This is substantially more memory efficient than get_all_layer_embeddings because
+        it only keeps the chosen layer for each batch and immediately discards the rest.
+
+        Args:
+            texts: list or single string
+            layer_idx: which hidden state index to use (0..num_layers). Matches HF hidden_states indexing.
+            pooling: one of mean|max|first|last|attn (attention-weighted mean)
+            batch_size: batch size for forward pass
+            max_length: maximum tokens per text
+            show_progress: show tqdm progress bar
+            return_attention: when pooling='attn', also return the per-text attention weights vector used for pooling
+        Returns:
+            If return_attention is False: np.ndarray shape (num_texts, hidden_size)
+            If return_attention is True and pooling='attn': (embeds: np.ndarray (N, H), weights: List[np.ndarray])
+        """
+        print(pooling)
+        if isinstance(texts, str):
+            texts = [texts]
+
+        pooled_vectors: List[np.ndarray] = []
+        attn_weights_list: List[np.ndarray] = []
+        iterator = range(0, len(texts), batch_size)
+        if show_progress and len(texts) > batch_size:
+            iterator = tqdm(iterator, desc="Extracting pooled layer embeddings")
+
+        for batch_index, i in enumerate(iterator):
+            batch = texts[i:i + batch_size]
+            model_inputs = self.tokenizer(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+            )
+            model_inputs = {k: v.to(self.device) for k, v in model_inputs.items()}
+            with torch.no_grad():
+                want_attn = pooling in {"attn", "attention", "attn_mean", "attn_weighted"}
+                try:
+                    outputs = self.model(**model_inputs, output_hidden_states=True, output_attentions=want_attn)
+                except TypeError:
+                    # Some models may not accept output_attentions kwarg
+                    outputs = self.model(**model_inputs, output_hidden_states=True)
+
+            hidden_states = outputs.hidden_states
+            if layer_idx >= len(hidden_states):
+                raise ValueError(f"Requested layer_idx={layer_idx} but only {len(hidden_states)} hidden states returned")
+
+            chosen = hidden_states[layer_idx]  # (batch, seq, hidden)
+            attention_mask = model_inputs['attention_mask']  # (batch, seq)
+
+            # Attentions may correspond to transformer layers only (no embedding layer). Map index when needed.
+            attentions = getattr(outputs, "attentions", None) if 'want_attn' in locals() and want_attn else None
+            # Map hidden_states index to attentions index: hidden_states[0] is embeddings; attentions[0] is layer 0
+            attn_tensor = None
+            if attentions is not None and isinstance(attentions, (tuple, list)) and len(attentions) > 0:
+                if layer_idx == 0:
+                    attn_tensor = None  # no attention for embedding layer
+                else:
+                    attn_idx = min(layer_idx - 1, len(attentions) - 1)
+                    attn_tensor = attentions[attn_idx]  # (batch, heads, seq, seq)
+
+            for b in range(chosen.size(0)):
+                valid = attention_mask[b].bool()
+                token_reps = chosen[b][valid]  # (valid_seq, hidden)
+                if token_reps.shape[0] == 0:
+                    vec = torch.zeros(chosen.size(-1), device=chosen.device)
+                    w_vec = None
+                else:
+                    # Normalize pooling key to unify synonyms
+                    pooling_key = pooling.lower()
+                    if pooling_key in {"attn_mean", "attn_weighted", "attention"}:
+                        pooling_key = "attn"
+
+                    if pooling == 'mean':
+                        vec = token_reps.mean(dim=0)
+                    elif pooling == 'max':
+                        vec, _ = token_reps.max(dim=0)
+                    elif pooling == 'first':
+                        vec = token_reps[0]
+                    elif pooling == 'last':
+                        vec = token_reps[-1]
+                    elif pooling_key == "attn" and attn_tensor is not None:
+                        # attn_tensor: (heads, seq, seq) for this sample
+                        a = attn_tensor[b]
+                        # Average across heads and query positions -> per-key weights (seq,)
+                        # Mask out padding positions
+                        w = a.mean(dim=0).mean(dim=0)  # (seq,)
+                        w_valid = w[valid]
+                        # Normalize to sum=1 with numerical safety
+                        w_sum = w_valid.sum()
+                        if torch.isfinite(w_sum) and w_sum > 0:
+                            w_norm = w_valid / w_sum
+                        else:
+                            w_norm = torch.full_like(w_valid, 1.0 / max(1, w_valid.numel()))
+                        vec = (token_reps * w_norm.unsqueeze(-1)).sum(dim=0)
+                        w_vec = w_norm.detach().cpu().float().numpy()
+                    elif pooling_key == "attn" and attn_tensor is None:
+                        # Graceful fallback when attentions are unavailable (e.g., sdpa or flash attention)
+                        # Use mean pooling and return uniform weights if requested
+                        vec = token_reps.mean(dim=0)
+                        seq_len = int(valid.sum().item())
+                        if seq_len > 0:
+                            w_vec = np.full((seq_len,), 1.0 / seq_len, dtype=np.float32)
+                        else:
+                            w_vec = None
+                    else:
+                        raise ValueError(f"Unsupported pooling: {pooling}")
+                pooled_vectors.append(vec.detach().cpu().float().numpy())
+                if return_attention and pooling.lower() in {"attn", "attention", "attn_mean", "attn_weighted"}:
+                    # If attention not available, append a uniform vector matching valid tokens
+                    if w_vec is None:
+                        seq_len = int(valid.sum().item())
+                        if seq_len == 0:
+                            attn_weights_list.append(np.array([], dtype=np.float32))
+                        else:
+                            attn_weights_list.append(np.full((seq_len,), 1.0 / seq_len, dtype=np.float32))
+                    else:
+                        attn_weights_list.append(w_vec.astype(np.float32))
+
+            # Optional memory logging
+            if self.log_memory and (batch_index % self.memory_interval == 0):
+                self._log_memory_usage(batch_index, len(batch), model_inputs)
+
+            # Explicit cleanup
+            del outputs, hidden_states, chosen, model_inputs
+            if torch.cuda.is_available() and 'cuda' in str(self.device):
+                torch.cuda.empty_cache()
+
+        embeds = np.vstack(pooled_vectors).astype(np.float32)
+        if return_attention and pooling.lower() in {"attn", "attention", "attn_mean", "attn_weighted"}:
+            return embeds, attn_weights_list
+        return embeds
 
 #### --------------------------------------------- from embeddings generate features for classification --------------------------------------------
 
@@ -187,13 +389,18 @@ def pool_embeds_from_layer(selected_embeds_at_choosen_layer, pooling='mean'):
         elif np.isnan(emb).all():
             print(f"⚠️  Warning: All-NaN embedding at index {idx}, using zeros")
             pooled_emb = np.zeros(emb.shape[1] if len(emb.shape) > 1 else 768)
-        if pooling == 'mean':
+        # Normalize pooling key and treat attention-based requests as mean in this stateless context
+        pooling_key = str(pooling).lower()
+        if pooling_key in {"attn", "attention", "attn_mean", "attn_weighted"}:
+            pooling_key = 'mean'
+
+        if pooling_key == 'mean':
             pooled_emb = emb.mean(axis=0)  # (hidden,)
-        elif pooling == 'max':
+        elif pooling_key == 'max':
             pooled_emb = emb.max(axis=0)  # (hidden,)
-        elif pooling == 'first':
+        elif pooling_key == 'first':
             pooled_emb = emb[0]  # (hidden,)
-        elif pooling == 'last':
+        elif pooling_key == 'last':
             pooled_emb = emb[-1]  # (hidden,)
         else:
             raise ValueError(f"Unsupported pooling: {pooling}")
@@ -206,22 +413,4 @@ def pool_embeds_from_layer(selected_embeds_at_choosen_layer, pooling='mean'):
 
 
 if __name__ == "__main__":
-    # Initialize
-    #"Qwen/Qwen2.5-0.5B"
-    #"meta-llama/Llama-3.1-8B"
-    calc = PerplexityCalculator(model_name="Qwen/Qwen2.5-0.5B",device='cuda:2')
-    
-    # Sample texts
-    texts = [
-        "The quick brown fox jumps over the lazy dog.",
-        "asdf jkl qwerty zxcv random nonsense words here",
-        "Machine learning is a subset of artificial intelligence that focuses on algorithms.",
-    ]
-    
-    # Calculate perplexities
-    perplexities = calc.calculate_batch_perplexity(texts)
-    
-    # Display results
-    for text, ppl in zip(texts, perplexities):
-        print(f"Text: {text[:50]}...")
-        print(f"Perplexity: {ppl:.2f}\n")
+    print("EmbeddingExtractor module: run your own test in scripts using the new memory-efficient methods.")
