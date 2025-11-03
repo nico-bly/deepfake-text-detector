@@ -6,7 +6,7 @@ Contains the main implementation modules:
 - classifiers: Binary classification and outlier detection  
 """
 
-from .extractors import EmbeddingExtractor
+from .extractors import EmbeddingExtractor, TFIDFExtractor
 from .classifiers import OutlierDetections, TrajectoryClassifier, BinaryDetector
 from .text_features import TextIntrinsicDimensionCalculator, PerplexityCalculator
 
@@ -16,5 +16,6 @@ __all__ = [
     "TrajectoryClassifier",
     "BinaryDetector",
     "PerplexityCalculator",
-    "TextIntrinsicDimensionCalculator"
+    "TextIntrinsicDimensionCalculator",
+    "TFIDFExtractor",
 ]
