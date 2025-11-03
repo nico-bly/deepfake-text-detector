@@ -4,17 +4,18 @@ from transformers import AutoTokenizer, AutoModel
 import pandas as pd
 import copy
 
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, TruncatedSVD
 from sklearn.covariance import EllipticEnvelope
 from sklearn.ensemble import IsolationForest
 from sklearn.svm import OneClassSVM
 from sklearn.metrics import accuracy_score, classification_report
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MaxAbsScaler
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.svm import SVC
 from sklearn.model_selection import cross_val_score, train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.linear_model import LogisticRegression
+from scipy.sparse import issparse
 
 import xgboost as xgb
 
@@ -216,19 +217,30 @@ class BinaryDetector:
             input_dim: Input dimension for neural classifier
         """
         self.scaler = StandardScaler()
-        self.pca = None  # Only initialize PCA if needed
+        self.scaler_sparse = MaxAbsScaler()
+        self.pca = None  # PCA for dense
+        self.svd = None  # TruncatedSVD for sparse
         self.n_components = n_components
         self.random_state = random_state
         self.input_dim = input_dim  # Store raw input dimension
-        
+
         # Components
         self.classifier = None
-        self.real_centroid = None
+        self.real_centroid = None  # computed in preprocessed feature space
         self._is_fitted = False
+        self._centroid_space = "preprocessed"  # informational
     
-    def _init_classifier(self, classifier_type="svm"):
+    def _init_classifier(self, classifier_type="svm", sparse_input: bool = False):
         """Initialize classifier (SVM or logistic regression)"""
         if classifier_type == "svm":
+            # RBF SVM doesn't support sparse matrices. If features are sparse, prefer LR with saga.
+            if sparse_input:
+                return LogisticRegression(
+                    random_state=self.random_state,
+                    class_weight='balanced',
+                    solver='saga',
+                    max_iter=2000
+                )
             return SVC(
                 kernel='rbf',
                 probability=True,
@@ -236,11 +248,12 @@ class BinaryDetector:
                 class_weight='balanced'
             )
         elif classifier_type == "lr":
-            
+            # Use saga to support both dense and sparse
             return LogisticRegression(
                 random_state=self.random_state,
                 class_weight='balanced',
-                max_iter=1000
+                max_iter=2000,
+                solver='saga'
             )
         elif classifier_type== "xgb":
             return xgb.XGBClassifier(
@@ -264,24 +277,53 @@ class BinaryDetector:
             raise ValueError(f"Unknown classifier_type: {classifier_type}")
         
     def _preprocess_features(self, features, fit=False):
-        """Preprocess features with scaling and optional PCA"""
-        # Always scale
-        if fit:
-            features = self.scaler.fit_transform(features)
-        else:
-            features = self.scaler.transform(features)
-            
-        # Apply PCA if specified
-        if self.n_components is not None:
-            if self.pca is None:
-                self.pca = PCA(n_components=self.n_components)
-                features = self.pca.fit_transform(features)
-                print(f"PCA reduced shape: {features.shape}")
-                print(f"Explained variance ratio: {self.pca.explained_variance_ratio_.sum():.3f}")
+        """Preprocess features with scaling and dimensionality reduction.
+
+        Dense path: StandardScaler (+ optional PCA)
+        Sparse path: If n_components is set -> TruncatedSVD to dense then StandardScaler.
+                     Else -> MaxAbsScaler (keeps sparse) and no PCA.
+        """
+        sparse = issparse(features)
+
+        if not sparse:
+            # Dense pipeline
+            if fit:
+                features = self.scaler.fit_transform(features)
             else:
-                features = self.pca.transform(features)
-                
-        return features
+                features = self.scaler.transform(features)
+
+            if self.n_components is not None:
+                if self.pca is None:
+                    self.pca = PCA(n_components=self.n_components, random_state=self.random_state)
+                    features = self.pca.fit_transform(features)
+                    print(f"PCA reduced shape: {features.shape}")
+                    print(f"Explained variance ratio: {self.pca.explained_variance_ratio_.sum():.3f}")
+                else:
+                    features = self.pca.transform(features)
+            return features
+        else:
+            # Sparse pipeline
+            if self.n_components is not None:
+                # Dimensionality reduction to dense with SVD, then scale dense
+                if fit or self.svd is None:
+                    self.svd = TruncatedSVD(n_components=self.n_components, random_state=self.random_state)
+                    features = self.svd.fit_transform(features)
+                    print(f"SVD reduced shape: {features.shape}")
+                    explained = getattr(self.svd, 'explained_variance_ratio_', None)
+                    if explained is not None:
+                        print(f"Explained variance ratio (SVD): {explained.sum():.3f}")
+                    features = self.scaler.fit_transform(features)
+                else:
+                    features = self.svd.transform(features)
+                    features = self.scaler.transform(features)
+                return features
+            else:
+                # Keep sparse structure; scale with MaxAbsScaler (no centering)
+                if fit:
+                    features = self.scaler_sparse.fit_transform(features)
+                else:
+                    features = self.scaler_sparse.transform(features)
+                return features
     
     def fit(self, embeddings, labels, validation_split=0.2, classifier_type="svm", pca=True):
         """
@@ -304,16 +346,18 @@ class BinaryDetector:
         # Preprocess features
         features = self._preprocess_features(embeddings, fit=True)
 
-        # Calculate real centroid for distance calculations
+        # Calculate centroid in PREPROCESSED space for stable distance calculations (handles sparse)
         real_mask = (labels == 0)
-        if np.sum(real_mask) > 0:
-            self.real_centroid = np.mean(embeddings[real_mask], axis=0)
+        feats_for_centroid = features[real_mask] if np.sum(real_mask) > 0 else features
+        if issparse(feats_for_centroid):
+            # Convert 1xN sparse mean to dense 1D array
+            self.real_centroid = np.asarray(feats_for_centroid.mean(axis=0)).ravel()
         else:
-            print("Warning: No real samples found (label=0)")
-            self.real_centroid = np.mean(embeddings, axis=0)
+            self.real_centroid = np.mean(feats_for_centroid, axis=0)
         
         # Train/validation split if requested
-        if validation_split > 0 and len(embeddings) > 50:
+        n_samples = embeddings.shape[0]
+        if validation_split > 0 and n_samples > 50:
             X_train, X_val, y_train, y_val = train_test_split(
                 features, labels,
                 test_size=validation_split,
@@ -326,7 +370,8 @@ class BinaryDetector:
         
         # Train classifier
         print(f"Fitting {classifier_type.upper()} classifier...")
-        self.classifier = self._init_classifier(classifier_type)
+        sparse_input = issparse(features)
+        self.classifier = self._init_classifier(classifier_type, sparse_input=sparse_input)
         
         # Handle neural network training separately
         if classifier_type == "neural":
@@ -360,20 +405,20 @@ class BinaryDetector:
         # Training metrics
         train_acc = accuracy_score(y_train, train_pred)
         
-        if pca:
-            results = {
-                'train_accuracy': train_acc,
-                'n_samples': len(embeddings),
-                'n_features': embeddings.shape[1],
-                'n_components': self.pca.n_components_
-            }
+        # Report dimensionality info depending on reduction path
+        if self.pca is not None:
+            n_comps = self.pca.n_components_
+        elif self.svd is not None:
+            n_comps = self.svd.n_components
         else:
-            results = {
-                'train_accuracy': train_acc,
-                'n_samples': len(embeddings),
-                'n_features': embeddings.shape[1],
-                'n_components': embeddings.shape[1]
-            }
+            n_comps = features.shape[1] if not issparse(features) else getattr(features, 'shape')[1]
+
+        results = {
+            'train_accuracy': train_acc,
+            'n_samples': embeddings.shape[0],
+            'n_features': embeddings.shape[1],
+            'n_components': n_comps
+        }
         
         print(f"Training accuracy: {train_acc:.3f}")
         print("Training Classification Report:")
@@ -414,7 +459,7 @@ class BinaryDetector:
         """
         if not self._is_fitted:
             raise ValueError("Detector not fitted! Call fit() first.")
-        
+
         features = self._preprocess_features(embeddings, fit=False)
         
         # Check if classifier is neural network
@@ -440,7 +485,12 @@ class BinaryDetector:
             results.append(probabilities)
         
         if return_distances:
-            distances = np.linalg.norm(embeddings - self.real_centroid, axis=1)
+            # Distances in the same preprocessed space as centroid
+            if issparse(features):
+                feats_dense = features.toarray()
+            else:
+                feats_dense = features
+            distances = np.linalg.norm(feats_dense - self.real_centroid, axis=1)
             results.append(distances)
         
         return results if len(results) > 1 else results[0]
@@ -579,7 +629,11 @@ class OutlierDetections:
         self.real_embeddings_pca = self.pca.fit_transform(self.real_embeddings_scaled)
 
         print(f"PCA reduced shape: {self.real_embeddings_pca.shape}")
-        print(f"Explained variance ratio: {self.pca.explained_variance_ratio_.sum():.3f}")
+        try:
+            ratio_sum = float(np.nansum(self.pca.explained_variance_ratio_))
+            print(f"Explained variance ratio: {ratio_sum:.3f}")
+        except Exception:
+            print("Explained variance ratio: N/A")
 
         # Centroid on train
         self.real_centroid = np.mean(self.real_embeddings_pca, axis=0)
@@ -608,9 +662,12 @@ class OutlierDetections:
             val_predictions = np.array([0 if pred == 1 else 1 for pred in val_raw_preds])
             val_acc = accuracy_score(y_val, val_predictions)
             results['val_accuracy'] = val_acc
-            print(f"Training accuracy: {train_acc:.3f} | Validation accuracy: {val_acc:.3f}")
+            train_acc_str = f"{train_acc:.3f}" if isinstance(train_acc, (int, float, np.floating)) else "N/A"
+            val_acc_str = f"{val_acc:.3f}" if isinstance(val_acc, (int, float, np.floating)) else "N/A"
+            print(f"Training accuracy: {train_acc_str} | Validation accuracy: {val_acc_str}")
         else:
-            print(f"Training accuracy: {train_acc:.3f}")
+            train_acc_str = f"{train_acc:.3f}" if isinstance(train_acc, (int, float, np.floating)) else "N/A"
+            print(f"Training accuracy: {train_acc_str}")
 
         print(f"{self.detector_type.upper()} outlier detector training completed!")
 
