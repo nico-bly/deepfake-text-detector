@@ -6,6 +6,13 @@ import psutil
 from transformers import AutoTokenizer, AutoModel
 import torch.nn.functional as F
 from tqdm import tqdm
+from typing import Optional
+
+# Optional sklearn import guarded for environments without it at runtime
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+except Exception:
+    TfidfVectorizer = None  # type: ignore
 
 ### ------------- model to extract embedding from decoder or encoder language models
 class EmbeddingExtractor(torch.nn.Module):
@@ -207,6 +214,7 @@ class EmbeddingExtractor(torch.nn.Module):
         max_length: int = 8192,
         show_progress: bool = True,
         return_attention: bool = False,
+        normalize: bool = False,
     ) -> Union[np.ndarray, tuple]:
         """Return pooled embeddings for a single layer without storing all layers.
 
@@ -221,6 +229,7 @@ class EmbeddingExtractor(torch.nn.Module):
             max_length: maximum tokens per text
             show_progress: show tqdm progress bar
             return_attention: when pooling='attn', also return the per-text attention weights vector used for pooling
+            normalize: if True, L2-normalize each pooled embedding to unit norm (default: False)
         Returns:
             If return_attention is False: np.ndarray shape (num_texts, hidden_size)
             If return_attention is True and pooling='attn': (embeds: np.ndarray (N, H), weights: List[np.ndarray])
@@ -283,14 +292,36 @@ class EmbeddingExtractor(torch.nn.Module):
                     if pooling_key in {"attn_mean", "attn_weighted", "attention"}:
                         pooling_key = "attn"
 
-                    if pooling == 'mean':
+                    if pooling_key == 'mean':
                         vec = token_reps.mean(dim=0)
-                    elif pooling == 'max':
+                    elif pooling_key == 'max':
                         vec, _ = token_reps.max(dim=0)
-                    elif pooling == 'first':
+                    elif pooling_key == 'first':
                         vec = token_reps[0]
-                    elif pooling == 'last':
+                    elif pooling_key == 'last':
                         vec = token_reps[-1]
+                    elif pooling_key == 'mean_std':
+                        # Concatenate mean and std over tokens -> shape (2*hidden,)
+                        # Compute in float32 end-to-end to avoid fp16 overflow when converting std
+                        mu = token_reps.float().mean(dim=0)
+                        sigma = token_reps.float().std(dim=0, unbiased=False)
+                        vec = torch.cat([mu, sigma], dim=0)  # keep float32
+                    elif pooling_key in {"statistical", "covariance", "cov"}:
+                        # Covariance pooling (upper-triangular flatten). Beware of dimensionality: H*(H+1)/2
+                        # To avoid explosions on large H, cap to max hidden size via env var COV_MAX_HIDDEN (default 1024).
+                        H = token_reps.shape[-1]
+                        max_h = int(os.environ.get("COV_MAX_HIDDEN", "1024"))
+                        X = token_reps.float()
+                        Xc = X - X.mean(dim=0, keepdim=True)
+                        if H <= max_h:
+                            # Compute full covariance and flatten upper triangle
+                            C = (Xc.T @ Xc) / max(1, (Xc.shape[0] - 1))  # (H, H) float32
+                            iu = torch.triu_indices(H, H)
+                            vec = C[iu[0], iu[1]]  # keep float32
+                        else:
+                            # Fallback: use only the diagonal (variances) when hidden size is too large
+                            var = Xc.var(dim=0, unbiased=False)
+                            vec = var  # float32
                     elif pooling_key == "attn" and attn_tensor is not None:
                         # attn_tensor: (heads, seq, seq) for this sample
                         a = attn_tensor[b]
@@ -339,6 +370,14 @@ class EmbeddingExtractor(torch.nn.Module):
                 torch.cuda.empty_cache()
 
         embeds = np.vstack(pooled_vectors).astype(np.float32)
+        
+        # Optional L2 normalization
+        if normalize:
+            norms = np.linalg.norm(embeds, axis=1, keepdims=True)
+            # Avoid division by zero
+            norms = np.where(norms == 0, 1.0, norms)
+            embeds = embeds / norms
+        
         if return_attention and pooling.lower() in {"attn", "attention", "attn_mean", "attn_weighted"}:
             return embeds, attn_weights_list
         return embeds
@@ -394,14 +433,33 @@ def pool_embeds_from_layer(selected_embeds_at_choosen_layer, pooling='mean'):
         if pooling_key in {"attn", "attention", "attn_mean", "attn_weighted"}:
             pooling_key = 'mean'
 
+        # Compute in float32 to avoid fp16 overflow in variance/std paths
+        X = emb.astype(np.float32, copy=False)
+
         if pooling_key == 'mean':
-            pooled_emb = emb.mean(axis=0)  # (hidden,)
+            pooled_emb = X.mean(axis=0)  # (hidden,)
         elif pooling_key == 'max':
-            pooled_emb = emb.max(axis=0)  # (hidden,)
+            pooled_emb = X.max(axis=0)  # (hidden,)
         elif pooling_key == 'first':
-            pooled_emb = emb[0]  # (hidden,)
+            pooled_emb = X[0]  # (hidden,)
         elif pooling_key == 'last':
-            pooled_emb = emb[-1]  # (hidden,)
+            pooled_emb = X[-1]  # (hidden,)
+        elif pooling_key == 'mean_std':
+            mu = X.mean(axis=0)
+            sigma = X.std(axis=0)  # ddof=0 (population) matches unbiased=False above
+            pooled_emb = np.concatenate([mu, sigma], axis=0).astype(np.float32, copy=False)  # (2*hidden,)
+        elif pooling_key in {'statistical', 'covariance', 'cov'}:
+            # Covariance pooling (upper triangular flatten) with safety cap
+            H = X.shape[-1]
+            max_h = int(os.environ.get("COV_MAX_HIDDEN", "1024"))
+            Xc = X - X.mean(axis=0, keepdims=True)
+            if H <= max_h:
+                C = (Xc.T @ Xc) / max(1, (Xc.shape[0] - 1))  # (H, H)
+                iu = np.triu_indices(H)
+                pooled_emb = C[iu].astype(np.float32, copy=False)
+            else:
+                # Fallback to diagonal (variances) if hidden size too large
+                pooled_emb = Xc.var(axis=0).astype(np.float32, copy=False)
         else:
             raise ValueError(f"Unsupported pooling: {pooling}")
         
@@ -414,3 +472,107 @@ def pool_embeds_from_layer(selected_embeds_at_choosen_layer, pooling='mean'):
 
 if __name__ == "__main__":
     print("EmbeddingExtractor module: run your own test in scripts using the new memory-efficient methods.")
+
+
+# ------------------------------ Classical NLP feature extractor (TF-IDF) ------------------------------
+class TFIDFExtractor:
+    """
+    Lightweight wrapper around sklearn's TfidfVectorizer to plug TF-IDF features
+    into the existing classifier pipeline.
+
+    Notes:
+    - Returns a scipy.sparse CSR matrix by default to be memory efficient.
+      Set dense=True in transform/fit_transform to get a dense float32 ndarray
+      if your downstream classifier requires dense inputs.
+    - Keep max_features modest if you plan to densify (e.g., <= 10-20k).
+    """
+
+    def __init__(
+        self,
+        max_features: Optional[int] = 20000,
+        ngram_range=(1, 2),
+        lowercase: bool = True,
+        min_df: int | float = 1,
+        max_df: int | float = 1.0,
+        use_idf: bool = True,
+        norm: Optional[str] = "l2",
+        sublinear_tf: bool = False,
+        stop_words: Optional[str | list[str]] = None,
+    ) -> None:
+        if TfidfVectorizer is None:
+            raise ImportError("scikit-learn is required for TFIDFExtractor but was not found.")
+
+        # Sanitize df parameters to satisfy sklearn's type constraints
+        # min_df: float in [0,1] or int in [1, inf)
+        # max_df: float in (0,1] or int in [1, inf)
+        min_df_val = min_df
+        max_df_val = max_df
+        try:
+            # If user passed a float like 2.0, cast to int 2
+            if isinstance(min_df_val, float) and min_df_val >= 1.0:
+                if abs(min_df_val - round(min_df_val)) < 1e-9:
+                    min_df_val = int(round(min_df_val))
+            # If user passed a float > 1.0 for max_df, try to interpret as integer count if near-integer
+            if isinstance(max_df_val, float) and max_df_val > 1.0:
+                if abs(max_df_val - round(max_df_val)) < 1e-9:
+                    max_df_val = int(round(max_df_val))
+                else:
+                    # Fallback: cap to 1.0 to keep as valid fraction
+                    max_df_val = 1.0
+        except Exception:
+            # On any sanitization error, fall back to original values
+            min_df_val = min_df
+            max_df_val = max_df
+
+        self.vectorizer = TfidfVectorizer(
+            max_features=max_features,
+            ngram_range=ngram_range,
+            lowercase=lowercase,
+            min_df=min_df_val,
+            max_df=max_df_val,
+            use_idf=use_idf,
+            norm=norm,
+            sublinear_tf=sublinear_tf,
+            stop_words=stop_words,
+        )
+        self._is_fitted = False
+
+    def fit(self, texts: List[str]):
+        """Fit the TF-IDF vocabulary/statistics on a corpus of raw texts."""
+        self.vectorizer.fit(texts)
+        self._is_fitted = True
+        return self
+
+    def transform(self, texts: List[str], dense: bool = False):
+        """Transform texts to TF-IDF features.
+
+        Args:
+            texts: list of raw text strings
+            dense: if True, returns a dense np.ndarray[float32]. If False (default), returns CSR sparse matrix.
+        """
+        if not self._is_fitted:
+            raise ValueError("TFIDFExtractor not fitted. Call fit() or fit_transform() first.")
+        X = self.vectorizer.transform(texts)
+        if dense:
+            return X.toarray().astype(np.float32)
+        return X
+
+    def fit_transform(self, texts: List[str], dense: bool = False):
+        """Fit on texts and return the TF-IDF feature matrix.
+
+        Args:
+            texts: list of raw text strings
+            dense: if True, returns a dense np.ndarray[float32]. If False (default), returns CSR sparse matrix.
+        """
+        X = self.vectorizer.fit_transform(texts)
+        self._is_fitted = True
+        if dense:
+            return X.toarray().astype(np.float32)
+        return X
+
+    def get_feature_names(self) -> List[str]:
+        return list(self.vectorizer.get_feature_names_out())
+
+    def vocabulary_size(self) -> int:
+        voc = getattr(self.vectorizer, "vocabulary_", None)
+        return len(voc) if voc is not None else 0
