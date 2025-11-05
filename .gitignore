@@ -87,3 +87,5 @@ htmlcov/
 tmp/
 temp/
 deploy_to_vps.sh
+
+docs.old
