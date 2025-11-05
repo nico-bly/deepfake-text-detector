@@ -77,36 +77,7 @@ def test_detect():
     return True
 
 
-def test_detect_pair():
-    """Test pair detection endpoint."""
-    print("\n🔍 Testing /detect-pair endpoint...")
-    
-    test_pair = {
-        "text1": "I went to the store yesterday and bought some groceries. The weather was nice.",
-        "text2": "As an AI assistant, I can provide information on various topics. My purpose is to help users find answers."
-    }
-    
-    print(f"  Text 1: {test_pair['text1'][:60]}...")
-    print(f"  Text 2: {test_pair['text2'][:60]}...")
-    
-    try:
-        response = requests.post(
-            f"{API_BASE_URL}/detect-pair",
-            json=test_pair,
-            timeout=30
-        )
-        response.raise_for_status()
-        data = response.json()
-        
-        print(f"  ✅ Real Text ID: {data['real_text_id']}")
-        print(f"     Text 1 Prediction: {'FAKE' if data['text1_prediction'] == 1 else 'REAL'} ({data['text1_probability']:.2%})")
-        print(f"     Text 2 Prediction: {'FAKE' if data['text2_prediction'] == 1 else 'REAL'} ({data['text2_probability']:.2%})")
-        print(f"     Confidence: {data['confidence']:.2%}")
-        
-        return True
-    except requests.exceptions.RequestException as e:
-        print(f"  ❌ Pair detection failed: {e}")
-        return False
+## Pair detection test removed (endpoint no longer supported)
 
 
 def test_models_endpoint():
@@ -150,7 +121,6 @@ def main():
     results = {
         "Health Check": test_health(),
         "Detection": test_detect(),
-        "Pair Detection": test_detect_pair(),
         "Models Listing": test_models_endpoint()
     }
     
