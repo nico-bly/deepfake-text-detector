@@ -1,29 +1,20 @@
-#!/usr/bin/env python3
-"""
-ESA Challenge Main Script - Unified Binary Classification Approach
-
-This script implements the full pipeline using the new unified architecture:
-UnifiedTextDataset → DataLoader → EmbeddingExtractor → BinaryDetector
-
-Based on the framework from main.py but adapted for the unified approach
-focusing on embeddings-only classification.
-"""
-
 import os
 import sys
 import gc
 from pathlib import Path
-
+import traceback
+from tqdm import tqdm
 import torch
 import pandas as pd
 import numpy as np
+import torch.nn.functional as F
 
 # Add current directory to path
 sys.path.append(str(Path(__file__).parent))
 sys.path.append(str(Path(__file__).parent.parent))  # Add parent directory for models/utils access
 
-from utils.data_loader import create_unified_dataloaders, reconstruct_pairs_from_predictions
-from models.extractors import EmbeddingExtractor
+from utils.data_loader import get_text_dataloader, reconstruct_pairs_from_predictions, extract_training_data, create_unified_dataloaders
+from models.extractors import EmbeddingExtractor, extract_embed_at_layer, pool_embeds_from_layer
 from models.classifiers import BinaryDetector
 
 def clear_gpu_memory():
@@ -32,44 +23,6 @@ def clear_gpu_memory():
     torch.cuda.synchronize()
     gc.collect()
 
-def extract_training_data(train_dataloader, max_samples=None):
-    """
-    Extract training data from unified DataLoader
-    
-    Args:
-        train_dataloader: Unified DataLoader
-        max_samples: Maximum samples to extract (None for all)
-    
-    Returns:
-        all_texts: List of texts
-        all_labels: List of binary labels (0=real, 1=fake)
-    """
-    print("Extracting training data from unified DataLoader...")
-    
-    all_texts = []
-    all_labels = []
-    sample_count = 0
-    
-    for batch_idx, batch in enumerate(train_dataloader):
-        batch_texts = batch['texts']
-        batch_labels = batch['labels'].tolist()
-        
-        all_texts.extend(batch_texts)
-        all_labels.extend(batch_labels)
-        sample_count += len(batch_texts)
-        
-        if max_samples and sample_count >= max_samples:
-            break
-    
-    # Limit to max_samples if specified
-    if max_samples:
-        all_texts = all_texts[:max_samples]
-        all_labels = all_labels[:max_samples]
-    
-    print(f"Extracted {len(all_texts)} texts")
-    print(f"Label distribution: {np.bincount(all_labels)} (0=real, 1=fake)")
-    
-    return all_texts, all_labels
 
 
 def process_model_layer_combination(
@@ -80,7 +33,10 @@ def process_model_layer_combination(
     test_dataloader, 
     device='cuda:2',
     batch_size=16,
-    validation_split=0.2
+    validation_split=0.2,
+    pooling="mean",
+    normalize=False,
+    classifier_type='svm',
 ):
     """
     Process a single model-layer combination using unified approach
@@ -104,37 +60,45 @@ def process_model_layer_combination(
     
     # Clear memory before loading new model
     clear_gpu_memory()
-    
+    train_labels_array=np.array(train_labels)
     try:
+    
         # 1. Load EmbeddingExtractor
         print(f"Loading EmbeddingExtractor for {model_id}...")
         extractor = EmbeddingExtractor(model_id, device=device)
         
         # 2. Extract training embeddings
         print(f"Extracting training embeddings from layer {target_layer}...")
-        train_layer_embeddings = extractor.get_all_layer_embeddings(
+        # 1. Extract train embeddings (all layers, all texts)
+        train_embeds_all_layers = extractor.get_all_layer_embeddings(
             train_texts,
-            pooling='last_token',
-            batch_size=batch_size
-        )
+            batch_size=batch_size,
+            max_length=512,
+        )  # List[Dict[layer_idx, np.ndarray]]
         
-        train_embeddings = train_layer_embeddings[target_layer]
-        train_labels_array = np.array(train_labels)
-        
+        # 2. Select the target layer
+
+        train_embeds_layer = extract_embed_at_layer(train_embeds_all_layers, target_layer)  # List[np.ndarray]
+        if normalize:
+            train_embeds_layer = [F.normalize(torch.from_numpy(e), p=2, dim=1).numpy() for e in train_embeds_layer]
+
+        # 3. Pool embeddings
+        train_embeddings = pool_embeds_from_layer(train_embeds_layer, pooling=pooling)  # np.ndarray (n_texts, hidden)
         print(f"Training embeddings shape: {train_embeddings.shape}")
         
-        # 3. Initialize and train BinaryDetector
+        # 4. Fit classifier (e.g., BinaryDetector)
         print(f"Training BinaryDetector...")
         detector = BinaryDetector(
             n_components=0.95,
             contamination=0.1,
             random_state=42
         )
-        
+
         training_results = detector.fit(
             embeddings=train_embeddings,
             labels=train_labels_array,
-            validation_split=validation_split
+            validation_split=validation_split, classifier_type='neural',
+            pca=True
         )
         
         print(f"Training completed: {training_results}")
@@ -144,28 +108,39 @@ def process_model_layer_combination(
         test_predictions = []
         test_sample_ids = []
         
-        for batch in test_dataloader:
-            batch_texts = batch['texts']
-            batch_sample_ids = batch['sample_ids']
-            
-            # Extract embeddings for batch
-            batch_layer_embeddings = extractor.get_all_layer_embeddings(
+        for batch in tqdm(test_dataloader, desc="Test batches"):
+            batch_texts = batch['text']
+            batch_texts= preprocess_texts(batch_texts)
+            batch_sample_ids = batch['sample_id']
+        
+            test_embeds_all_layers = extractor.get_all_layer_embeddings(
                 batch_texts,
-                pooling='last_token',
-                batch_size=batch_size
+                batch_size=batch_size,
+                show_progress=False,
+                max_length=512,
             )
-            batch_embeddings = batch_layer_embeddings[target_layer]
+            test_embeds_layer = extract_embed_at_layer(test_embeds_all_layers, target_layer)
+            if normalize:
+                test_embeds_layer = [F.normalize(torch.from_numpy(e), p=2, dim=1).numpy() for e in test_embeds_layer]
+
+            batch_embeddings = pool_embeds_from_layer(test_embeds_layer, pooling=pooling)
+
+            if not np.all(np.isfinite(batch_embeddings)):
+                print("❌ Test batch embeddings contain NaN or Inf values! Skipping batch.")
+                print("Problematic texts:", batch_texts)
+                continue
             
             # Get predictions (probabilities of being fake)
             _, batch_probabilities = detector.predict(
                 batch_embeddings,
                 return_probabilities=True,
-                return_distances=False
+                return_distances=False,
+                pca=True
             )
             
             test_predictions.extend(batch_probabilities.tolist())
             test_sample_ids.extend(batch_sample_ids)
-        
+            
         print(f"Generated {len(test_predictions)} predictions")
         
         # 5. Reconstruct pairs for submission
@@ -187,15 +162,15 @@ def process_model_layer_combination(
         del extractor
         del detector
         clear_gpu_memory()
-        
+            
         return submission_df
-        
     except Exception as e:
         print(f"Error processing {model_id} layer {target_layer}: {e}")
+        traceback.print_exc()
         return None
-    
     finally:
         clear_gpu_memory()
+
 
 
 def ensemble_predictions_unified(all_results, voting="majority"):
@@ -345,6 +320,16 @@ def save_training_results(model_results, output_dir="results"):
     
     return summary_df
 
+def preprocess_texts(texts):
+    cleaned = []
+    for t in texts:
+        if not isinstance(t, str) or not t.strip():
+            # Replace empty text with a neutral placeholder (optional)
+            cleaned.append(" ")
+        else:
+            cleaned.append(t.strip())
+    return cleaned
+
 
 def quick_test_mode():
     """Run a quick test with minimal data to verify the pipeline"""
@@ -372,11 +357,14 @@ def quick_test_mode():
 
 
 def run_pipeline(
-    batch_size=16,
     max_train_samples=None,
-    device='cuda:2',
+    device='cuda:0',
     models_config=None,
-    test_mode=False
+    test_mode=False,
+    train_dataloader=None, 
+    test_dataloader=None,
+    batch_size=None,
+    classifier_type="svm"
 ):
     """
     Run the complete pipeline with given configuration
@@ -389,20 +377,8 @@ def run_pipeline(
         test_mode: Whether running in test mode
     """
     
-    # Default model configuration
-    if models_config is None:
-        models_config = {
-            "sentence-transformers/all-distilroberta-v1": [3, 4, 5],
-            "sentence-transformers/paraphrase-multilingual-mpnet-base-v2": [4, 5],
-        }
-    
     # Data paths
-    train_path = "/home/infres/billy-22/projets/esa_challenge_kaggle/esa-challenge-fake-texts/data/train"
-    train_labels_path = "/home/infres/billy-22/projets/esa_challenge_kaggle/esa-challenge-fake-texts/data/train.csv"
-    test_path = "/home/infres/billy-22/projets/esa_challenge_kaggle/esa-challenge-fake-texts/data/test"
-    
     print(f"Pipeline Configuration:")
-    print(f"  Batch size: {batch_size}")
     print(f"  Max training samples: {max_train_samples}")
     print(f"  Device: {device}")
     print(f"  Test mode: {test_mode}")
@@ -412,16 +388,7 @@ def run_pipeline(
     try:
         # 1. Create unified DataLoaders
         print("1. Creating Unified DataLoaders...")
-        train_dataloader, test_dataloader = create_unified_dataloaders(
-            train_path=train_path,
-            train_labels_path=train_labels_path,
-            test_path=test_path if not test_mode else None,
-            batch_size=batch_size,
-            num_workers=0,
-            max_length=512,
-            lazy_loading=True,
-            include_metadata=True
-        )
+        
         
         if train_dataloader is None:
             print("❌ Failed to create DataLoaders")
@@ -438,22 +405,31 @@ def run_pipeline(
             train_dataloader, 
             max_samples=max_train_samples
         )
+
+        train_texts = preprocess_texts(train_texts)
         
         # 3. Process each model-layer combination
         print(f"\n3. Processing Model-Layer Combinations...")
         all_results = []
-        
-        for model_id, layers in models_config.items():
-            for target_layer in layers:
+        for model_id, layer_pooling_list in models_config.items():
+            for layer_pooling in layer_pooling_list:
+                # 
+                target_layer = layer_pooling["layer"]
+                pooling = layer_pooling["pooling"]
+                normalize = layer_pooling.get("normalize", False)
+
                 submission_df = process_model_layer_combination(
                     model_id=model_id,
                     target_layer=target_layer,
+                    pooling=pooling,
+                    normalize=normalize,
                     train_texts=train_texts,
                     train_labels=train_labels,
                     test_dataloader=test_dataloader if test_dataloader else train_dataloader,
                     device=device,
                     batch_size=batch_size,
-                    validation_split=0.2
+                    validation_split=0.2,
+                    classifier_type=classifier_type
                 )
                 
                 all_results.append((model_id, target_layer, submission_df))
@@ -487,19 +463,84 @@ def run_pipeline(
 
 if __name__ == "__main__":
     print("ESA Challenge - Unified Binary Classification Pipeline")
+    from sklearn.model_selection import train_test_split
 
     # Full production configuration
     # "sentence-transformers/all-distilroberta-v1": [3, 4, 5],
     # "sentence-transformers/paraphrase-multilingual-mpnet-base-v2": [4, 5],
     # "meta-llama/Llama-3.1-8B": [26, 30],
+    # models--Qwen--Qwen3-8B
+    #"mixedbread-ai/mxbai-embed-large-v1":
+    '''
     models_config = {
-        "Qwen/Qwen3-Embedding-8B": [35],
-    }
-    success = run_pipeline(
-        batch_size=16,
-        max_train_samples=None,  # Use all training data
-        device='cuda:2',
-        models_config=models_config,
-        test_mode=False
-    )
+    "Qwen/Qwen3-Embedding-8B": [
+        {"layer": 35, "pooling": "mean", "normalize": True},
+        {"layer": 35, "pooling": "max", "normalize": True},
+        {"layer": 35, "pooling": "last", "normalize": True},
+    ],}
+    "Qwen/Qwen3-Embedding-8B"
+    Qwen/Qwen2.5-0.5B
+     "Qwen/Qwen3-8B"
+
+    '''
+    models_config = {
+     "Qwen/Qwen2.5-0.5B": [
+        {"layer": 22, "pooling": "mean", "normalize": False},
+    ],}
+
+    dataset = 'humanvsai'
+    batch_size=8
+
+    if dataset== 'esa_challenge':
+        train_path = "/home/infres/billy-22/projets/esa_challenge_kaggle/deepfake-text-detector/data/train"
+        train_labels_path = "/home/infres/billy-22/projets/esa_challenge_kaggle/deepfake-text-detector/data/train.csv"
+        test_path = "/home/infres/billy-22/projets/esa_challenge_kaggle/deepfake-text-detector/data/test"
+        
+        train_dataloader, test_dataloader = create_unified_dataloaders(
+            train_path=train_path,
+            train_labels_path=train_labels_path,
+            test_path=test_path,
+            batch_size=batch_size,
+            num_workers=0,
+            max_length=512,
+            lazy_loading=True,
+            include_metadata=True
+        )
+    elif dataset == 'humanvsai':
+        data_human_ai='/home/infres/billy-22/projets/esa_challenge_kaggle/deepfake-text-detector/data_human/AI_Human.csv'
+
+        # Load indices for train/val split (efficient, doesn't load all data at once)
+        df = pd.read_csv(data_human_ai, usecols=["text", "generated"])
+        train_idx, val_idx = train_test_split(df.index, test_size=0.2, stratify=df["generated"], random_state=42)
+
     
+        train_dataloader = get_text_dataloader(
+            data_source=data_human_ai,
+            dataset_type="csv",
+            batch_size=32,
+            shuffle=True,
+            indices=train_idx,
+            text_col="text",
+            label_col="generated"
+        )
+        
+        test_dataloader = get_text_dataloader(
+            data_source = data_human_ai,
+            dataset_type="csv",
+            batch_size=batch_size,
+            shuffle=False,
+            indices=val_idx,
+            text_col="text",
+            label_col="generated"
+        )
+
+    success = run_pipeline(
+        batch_size=8,
+        max_train_samples=None,  # Use all training data
+        device='cuda:0',
+        models_config=models_config,
+        test_mode=False,
+        test_dataloader=test_dataloader,
+        train_dataloader=train_dataloader,
+        classifier_type='svm'
+    )

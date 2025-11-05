@@ -1,399 +1,193 @@
-# 🏗️ Production Architecture for 512MB RAM Constraint
+# Architecture & Design Decisions
 
-## Problem
-Render free tier = 512MB RAM, but ML models need 2-8GB RAM.
+## System Overview
 
-## Solution
-Separate lightweight API gateway from heavy ML inference.
-
----
-
-## 🎯 Recommended Architecture
+The detector follows a modular pipeline:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    FRONTEND LAYER                           │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │   React + Vite (Vercel/Netlify FREE)                │   │
-│  │   - User interface                                   │   │
-│  │   - File upload                                      │   │
-│  │   - Results display                                  │   │
-│  └────────────────────┬────────────────────────────────┘   │
-└─────────────────────┬─┴────────────────────────────────────┘
-                      │
-                      │ HTTPS/REST
-                      │
-┌─────────────────────▼────────────────────────────────────────┐
-│                    API GATEWAY LAYER                         │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │   Lightweight Gateway (Render Free - 512MB)          │   │
-│  │   FastAPI or Express.js                              │   │
-│  │   - Authentication/Authorization                     │   │
-│  │   - Request routing                                  │   │
-│  │   - Rate limiting                                    │   │
-│  │   - Response caching (Redis/Upstash)                │   │
-│  │   - NO ML MODELS HERE                               │   │
-│  └───────────┬──────────────────────────────────────────┘   │
-└──────────────┴──────────────────────────────────────────────┘
-               │
-               │ Routes to appropriate service
-               │
-┌──────────────┴──────────────────────────────────────────────┐
-│                    ML INFERENCE LAYER                        │
-│                                                              │
-│  ┌────────────────────┐  ┌────────────────────┐            │
-│  │  Hugging Face      │  │  Modal.com         │            │
-│  │  Inference API     │  │  Serverless GPU    │            │
-│  │                    │  │                    │            │
-│  │  • Pre-trained     │  │  • Custom models   │            │
-│  │    models          │  │  • Your detectors  │            │
-│  │  • FREE tier       │  │  • Auto-scaling    │            │
-│  │  • 1k req/day      │  │  • Pay per use     │            │
-│  └────────────────────┘  └────────────────────┘            │
-│                                                              │
-│  Alternative: Replicate, RunPod, AWS Lambda + EFS           │
-└──────────────────────────────────────────────────────────────┘
-               │
-               │ Store/retrieve data
-               │
-┌──────────────┴──────────────────────────────────────────────┐
-│                    DATA LAYER                                │
-│                                                              │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌────────────┐  │
-│  │  PostgreSQL     │  │  S3/R2/Backblaze│  │  Upstash   │  │
-│  │  (Supabase)     │  │  (File Storage) │  │  (Redis)   │  │
-│  │                 │  │                 │  │            │  │
-│  │  • User data    │  │  • Trained      │  │  • Cache   │  │
-│  │  • Predictions  │  │    models       │  │  • Session │  │
-│  │  • Logs         │  │  • Datasets     │  │            │  │
-│  └─────────────────┘  └─────────────────┘  └────────────┘  │
-└──────────────────────────────────────────────────────────────┘
-               │
-               │ Scheduled tasks
-               │
-┌──────────────┴──────────────────────────────────────────────┐
-│                    AUTOMATION LAYER                          │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  GitHub Actions (FREE)                               │   │
-│  │  - Model training jobs (monthly)                     │   │
-│  │  - Data pipeline                                     │   │
-│  │  - Backup & cleanup                                  │   │
-│  └──────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────┘
+Raw Text
+  ↓ [Preprocessing: lowercase, normalize whitespace]
+  ↓ [Feature Extraction: embedding/TF-IDF/etc]
+  ↓ [Dimensionality reduction (optional): PCA, scaling]
+  ↓ [Classification: LR/SVM/Outlier Detection]
+  ↓ [Threshold application: optimize or fixed]
+  ↓ Output: P(fake) ∈ [0, 1], Decision ∈ {0, 1}
 ```
 
----
+## Feature Extractors
 
-## 🔧 Implementation Options
+### Embedding-based (Default)
 
-### **Option 1: Hugging Face + Render Gateway (Simplest)**
+**Process:**
+1. Tokenize text with HuggingFace model
+2. Forward pass through transformer → hidden states per layer
+3. **Extract single layer** (configurable, e.g., layer 18)
+4. **Pool tokens** (mean/last/mean_std) → single vector per text
+5. (Optional) **L2 normalize** → unit vectors
+6. Feed to classifier
+
+**Models tested:**
+- `microsoft/deberta-v3-large` – Strong baseline, 24 layers
+- `Qwen/Qwen3-Embedding-4B` – Lightweight embeddings
+- `sentence-transformers/paraphrase-multilingual-mpnet-base-v2` – Multilingual
+
+**Key parameters:**
+- `layer`: Which transformer layer to extract (typically mid-to-late, e.g., 12–23 of 24)
+- `pooling`: How to aggregate tokens
+  - `mean` – Average all tokens
+  - `last` – Take last token (usually `[EOS]`)
+  - `mean_std` – Concatenate mean + standard deviation
+  - `statistical` – Compute full covariance matrix (high-dim, use with caution)
+- `normalize`: L2 normalization before classifier
+
+**Memory efficiency:**
+- **Default (all layers)**: Load hidden states for all layers → ~35–40 GB for 4k texts × large model
+- **`--memory_efficient`**: Extract one layer at a time, discard others → ~20 GB
+- Strongly recommended for large-scale sweeps.
+
+### TF-IDF
+
+**Process:**
+1. Tokenize text (whitespace, remove stopwords)
+2. Build vocabulary & IDF weights
+3. Vectorize each text as sparse/dense TF-IDF vector
 
 **Pros:**
-- ✅ Minimal code changes
-- ✅ FREE tier: 1,000 requests/day
-- ✅ No infrastructure management
-- ✅ Pre-trained models work out-of-box
+- Fast, interpretable, no GPU needed
+- Works well for short-range stylistic differences
 
 **Cons:**
-- ❌ Can't use your custom trained detectors easily
-- ❌ Limited model selection
-- ❌ Slower for custom embeddings
+- Poor generalization across domains (0.64–0.80 ROC-AUC)
+- Sensitive to vocabulary choice
+- High-dimensional (20k+ features)
 
-**Best for:** MVP, testing, demos
+### Other (Perplexity, PHD)
 
----
+- **Perplexity**: Use language model to score text; lower perplexity ≈ human-like
+- **PHD (Intrinsic Dimensionality)**: Measure local dimensionality; AI text often has lower PHD
 
-### **Option 2: Modal.com + Render Gateway (Recommended)**
+Less reliable than embeddings; useful as ensemble features.
 
-**Pros:**
-- ✅ Use your exact training code
-- ✅ Load custom trained models
-- ✅ Auto-scaling (0 to infinity)
-- ✅ Only pay when running (~$0.10/1000 requests)
-- ✅ Keep your current model architecture
+## Classifiers
 
-**Cons:**
-- ❌ Small learning curve
-- ❌ Cold starts (5-10s first request, then fast)
+### Supervised
 
-**Best for:** Production with custom models
+**Logistic Regression** (`lr`)
+- Linear decision boundary in feature space
+- Fast, interpretable, often strong baseline
+- Requires normalized features; good with embedding pooling
 
-**Cost estimate:**
-- 10,000 requests/month ≈ **$1-2/month**
-- 100,000 requests/month ≈ **$10-20/month**
+**Support Vector Machine** (`svm`)
+- Non-linear boundaries (RBF kernel)
+- Works well with high-dimensional embeddings
+- Slower training than LR
 
----
+### Outlier Detection
 
-### **Option 3: AWS Lambda + EFS (Advanced)**
+Assume real text is "in-distribution"; AI text is outlier.
 
-**Pros:**
-- ✅ Generous free tier (1M requests/month)
-- ✅ Load models from EFS
-- ✅ Established platform
+**Isolation Forest** (`iforest`)
+- Fast, parallelizable
+- Works on high-dimensional data
+- Often competitive on new domains
 
-**Cons:**
-- ❌ Complex setup
-- ❌ 10GB Lambda limit
-- ❌ Cold starts
+**Elliptic Envelope** (`elliptic`)
+- Estimates covariance of the main cluster
+- Sensitive to initialization; may fail if data is not well-clustered
+- Useful when real data is homogeneous
 
-**Best for:** High-scale production (>1M requests/month)
+**One-Class SVM** (`ocsvm`)
+- Learns hypersphere around real data
+- Slower but robust
+- Best for well-separated domains
 
----
+## Why Outlier Detection?
 
-## 📝 Migration Path for Your Current Code
+When evaluating on a new dataset (e.g., Mercor AI after training on Human vs AI):
+- Domain shift is common → supervised classifiers overfit to train domain quirks
+- Outlier detection may generalize better if "real" text has consistent properties across domains
+- In practice: **outlier detectors ≈ supervised** in performance; sometimes +0.05 ROC-AUC on cross-dataset
 
-### Step 1: Keep Gateway Lightweight (Render Free Tier)
+## Threshold Optimization
 
-**File: `services/gateway_lite/main.py`**
+### Default (0.5)
+- Assumes equal class weight
+- Works if P(fake) is well-calibrated; often isn't
+
+### Optimized (validation-set tuning)
+1. Reserve 20% of validation set
+2. Sweep thresholds τ ∈ [0, 1] (step 0.01)
+3. For each τ: compute F1 (or target metric)
+4. Pick τ with best F1
+5. Report metrics at that τ
+
+**Why this matters:**
+- Model with high ROC-AUC but 0% F1 at τ=0.5? Optimize τ → F1 jumps to 0.75+
+- Class imbalance on eval set? Optimized τ adapts automatically
+- Different metrics (F1 vs precision) require different τ
+
+### Deployment strategy
+
+**If you know the target distribution:**
+- Optimize on a labeled validation set from that distribution
+- Use fixed τ for production
+
+**If unknown (e.g., Kaggle test set):**
+- Optimize on best-guess validation set (e.g., Mercor AI train)
+- Use that τ for final submission
+- Accept that τ may not be perfect if test distribution differs significantly
+
+## Class Imbalance & Stratified Sampling
+
+### Problem
+Without stratification, random sampling on imbalanced data → train on 70% real, 30% AI → classifier biased toward "real" → predicts mostly 0 → F1 = 0 even if AUC is high.
+
+### Solution
+`--stratified_sample` → sample exactly N/2 from each class
+- Gives classifier a fair chance to learn both classes
+- Metrics become interpretable (no "always predict 0" trap)
+- Works orthogonally to threshold optimization:
+  - **Balanced training** + **threshold optimization at eval time** = best of both worlds
+
+## Normalization (L2)
+
+**Effect:**
+- Normalize embeddings to unit length
+- Reduces variance in vector magnitudes; focuses on directions
+- Can help with distance-based classifiers (SVM, kNN)
+- Often neutral or slightly positive for LR
+
+**When to use:**
+- Default: ON (recommended)
+- Some embeddings (e.g., BAAI bge) already return normalized vectors; double-normalization is harmless
+- TF-IDF: Normalization can help or hurt; sweep both
+
+## Ensemble Strategy
+
+After a parameter sweep:
+1. **Rank configs by F1** on cross-dataset eval
+2. **Select top-15 per base model**, diversify by:
+   - Layer (e.g., 12, 18, 22)
+   - Pooling (mean, last, mean_std)
+   - Classifier (svm, lr, ocsvm)
+3. **Average probabilities** from selected configs
+4. **Optimize threshold** on ensemble output
+5. **Submit** with optimized threshold
+
+Example ensemble (3 configs):
 ```python
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import httpx
-import os
-
-app = FastAPI(title="Deepfake Gateway")
-
-MODAL_WEBHOOK_URL = os.getenv("MODAL_WEBHOOK_URL")
-
-class AnalyzeRequest(BaseModel):
-    text: str
-    model_name: str = "Qwen/Qwen2.5-0.5B"
-    layer: int = 22
-    classifier_type: str = "svm"
-
-@app.post("/analyze")
-async def analyze(req: AnalyzeRequest):
-    """Route to ML service (Modal/HF)"""
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            MODAL_WEBHOOK_URL,
-            json=req.dict()
-        )
-        return response.json()
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "ram_usage": "~50MB"}
-```
-
-**Memory usage: ~50-100MB** ✅
-
----
-
-### Step 2: Deploy ML Models to Modal
-
-**File: `modal_deployment/detector.py`**
-```python
-import modal
-from pathlib import Path
-
-# Create Modal app
-stub = modal.Stub("deepfake-text-detector")
-
-# Define the image with your dependencies
-image = (
-    modal.Image.debian_slim()
-    .pip_install(
-        "torch",
-        "transformers",
-        "scikit-learn",
-        "sentence-transformers",
-        "numpy",
-        "pandas"
-    )
-)
-
-# Mount your trained models
-models_volume = modal.NetworkFileSystem.from_name(
-    "deepfake-models", 
-    create_if_missing=True
-)
-
-@stub.function(
-    image=image,
-    gpu="T4",  # Optional: remove for CPU-only
-    memory=4096,  # 4GB RAM
-    timeout=300,
-    network_file_systems={"/models": models_volume}
-)
-def detect_deepfake(
-    text: str,
-    model_name: str,
-    layer: int,
-    classifier_type: str
-):
-    """
-    Your existing detection logic - no changes needed!
-    """
-    import sys
-    sys.path.append("/models")
-    
-    from extractors import EmbeddingExtractor
-    from classifiers import BinaryDetector
-    import pickle
-    
-    # Load your trained detector
-    detector_path = f"/models/detector_{model_name.replace('/', '_')}_layer{layer}_{classifier_type}.pkl"
-    with open(detector_path, "rb") as f:
-        detector = pickle.load(f)
-    
-    # Extract features
-    extractor = EmbeddingExtractor(model_name, device="cuda")
-    features = extractor.get_pooled_layer_embeddings(
-        [text],
-        layer_idx=layer,
-        pooling="mean"
-    )
-    
-    # Predict
-    pred, prob = detector.predict(features, return_probabilities=True)
-    
-    return {
-        "prediction": int(pred[0]),
-        "probability": float(prob[0]),
-        "is_fake": bool(pred[0] == 1)
-    }
-
-# Web endpoint
-@stub.webhook(method="POST")
-def webhook(data: dict):
-    result = detect_deepfake.remote(
-        text=data["text"],
-        model_name=data["model_name"],
-        layer=data["layer"],
-        classifier_type=data.get("classifier_type", "svm")
-    )
-    return result
-```
-
-**Deploy:**
-```bash
-# Install Modal CLI
-pip install modal
-
-# Authenticate
-modal token new
-
-# Deploy
-modal deploy modal_deployment/detector.py
-
-# Get your webhook URL (copy this to gateway env vars)
-# https://yourusername--deepfake-text-detector-webhook.modal.run
+probs = [
+    model1.predict_proba(text),  # deberta layer 18, mean, svm
+    model2.predict_proba(text),  # deberta layer 22, mean_std, lr
+    model3.predict_proba(text),  # qwen layer 4, last, ocsvm
+]
+ensemble_prob = np.mean(probs)
+prediction = ensemble_prob >= threshold  # threshold = 0.38
 ```
 
 ---
 
-### Step 3: Upload Your Trained Models to Modal
+## See Also
 
-```bash
-# One-time setup: upload your models
-modal volume put deepfake-models saved_models/
-```
-
-Or via Python:
-```python
-import modal
-
-# Get the volume
-volume = modal.NetworkFileSystem.lookup("deepfake-models")
-
-# Upload trained models
-with volume.batch_upload() as upload:
-    upload.put_directory("saved_models/", "/")
-```
-
----
-
-## 💰 Cost Comparison
-
-| Solution | Free Tier | Cost (10k req/mo) | Cost (100k req/mo) |
-|----------|-----------|-------------------|-------------------|
-| **HF Inference** | 1k/day | FREE | $50-100 |
-| **Modal.com** | - | $1-2 | $10-20 |
-| **Replicate** | - | $5 | $50 |
-| **RunPod** | - | $4 | $40 |
-| **AWS Lambda** | 1M free | FREE | FREE-$10 |
-| **Render 2GB** | - | $7/mo | $7/mo (but limited) |
-
----
-
-## 🚀 Recommended Setup for You
-
-### Phase 1: MVP (Start Here)
-```
-Frontend (Vercel) → Gateway (Render Free) → HF Inference API
-                          ↓
-                   PostgreSQL (Supabase)
-```
-**Cost:** FREE for <1k requests/day
-
-### Phase 2: Production (Custom Models)
-```
-Frontend (Vercel) → Gateway (Render Free) → Modal.com
-                          ↓
-                   PostgreSQL + S3
-```
-**Cost:** ~$1-5/month for 10k-50k requests
-
-### Phase 3: Scale (>100k requests/month)
-```
-Frontend (Vercel) → Gateway (Render Starter) → Modal.com + Cache
-                          ↓
-                   PostgreSQL + Redis + S3
-```
-**Cost:** ~$20-30/month
-
----
-
-## 📦 What to Store Where
-
-### Render Gateway (512MB)
-- ✅ API routing logic
-- ✅ Authentication
-- ✅ Input validation
-- ✅ Response caching (in-memory dict for last 100 results)
-- ❌ NO ML models
-- ❌ NO large datasets
-
-### Modal.com / HF
-- ✅ All ML models
-- ✅ Embedding extractors
-- ✅ Trained classifiers
-- ✅ Feature computation
-
-### S3 / Cloudflare R2
-- ✅ Trained model files (.pkl, .pt)
-- ✅ Training datasets
-- ✅ User uploads (if needed)
-
-### PostgreSQL (Supabase)
-- ✅ User accounts
-- ✅ Prediction history
-- ✅ API usage logs
-- ✅ Model metadata
-
----
-
-## 🔄 Migration Checklist
-
-- [ ] Create Modal account (free to start)
-- [ ] Deploy detector to Modal using provided code
-- [ ] Upload trained models to Modal volume
-- [ ] Update gateway to call Modal webhook
-- [ ] Add Modal webhook URL to Render env vars
-- [ ] Test end-to-end flow
-- [ ] Remove ML models from Render service
-- [ ] Deploy lightweight gateway
-- [ ] Monitor costs and performance
-
----
-
-## 🆘 Need Help?
-
-I can help you:
-1. Set up Modal deployment with your existing code
-2. Migrate specific detectors
-3. Optimize for cost/performance
-4. Set up caching to reduce API calls
-
-Just let me know which option you want to pursue!
+- [README.md](./README.md) – Quick start & full guide
+- [COOLIFY_DEPLOYMENT.md](./COOLIFY_DEPLOYMENT.md) – Deploy the API

@@ -1,315 +1,143 @@
-# 🚀 Coolify Deployment Guide
+# Coolify Deployment
 
-## Quick Start
+Deploy the deepfake detector API to Coolify for always-on inference.
 
-### 1️⃣ Prepare Your Models
+## Prerequisites
 
-Before deploying, make sure you have trained models in `saved_models/`:
+- Coolify instance running (self-hosted or SaaS)
+- GitHub repo with this code
+- Trained model saved as `saved_models/model.pkl`
+- Docker Hub account (for private images, optional)
+
+## Setup Steps
+
+### 1. Push Code to GitHub
+
+Ensure your repo is pushed with:
+- `Dockerfile` ✓
+- `requirements.txt` ✓
+- `api/app.py` ✓
+- Trained models in `saved_models/` (or mounted separately)
 
 ```bash
-# Check if you have trained models
-ls -lh saved_models/
-
-# If not, train some models first
-python scripts/train_and_save_detector.py
+git push origin main
 ```
 
-### 2️⃣ Test Locally with Docker
+### 2. Connect Repository to Coolify
+
+1. Log in to Coolify dashboard
+2. **New Project** → Select your GitHub repo
+3. Choose **Docker** as deployment type
+4. Point to `Dockerfile` in root directory
+
+### 3. Set Environment Variables
+
+In Coolify, configure:
+
+| Variable | Value | Notes |
+|----------|-------|-------|
+| `DEVICE` | `cpu` or `cuda:0` | Use `cpu` unless GPU available |
+| `PORT` | `8000` | FastAPI default |
+| `MODEL_PATH` | `saved_models/best_model.pkl` | Must exist in container |
+| `BATCH_SIZE` | `8` | For batch predictions |
+
+### 4. Mount Volumes (if needed)
+
+If models are stored externally or need persistence:
+
+```yaml
+volumes:
+  - /path/to/saved_models:/app/saved_models
+  - /path/to/data:/app/data
+```
+
+### 5. Deploy
+
+Click **Deploy** in Coolify. It will:
+- Build Docker image
+- Start container
+- Assign domain (e.g., `detector.example.com`)
+- Manage SSL certificate
+- Handle auto-restart on failure
+
+### 6. Verify
 
 ```bash
-# Build the image
-docker build -t deepfake-backend .
+curl https://detector.example.com/health
+# Expected response: {"status": "ok"}
 
-# Run locally
-docker run -p 8000:8000 \
-  -v $(pwd)/saved_models:/app/saved_models:ro \
-  deepfake-backend
+curl https://detector.example.com/docs
+# Opens interactive API docs
+```
 
-# Test the API
-curl http://localhost:8000/health
-curl -X POST http://localhost:8000/detect \
+## Usage
+
+### Health Check
+
+```bash
+curl https://detector.example.com/health
+```
+
+### Predict
+
+```bash
+curl -X POST https://detector.example.com/predict \
   -H "Content-Type: application/json" \
-  -d '{"text": "This is a test sentence to analyze."}'
+  -d '{"text": "This is a test sentence."}'
 ```
 
-### 3️⃣ Deploy to Coolify
-
-#### Option A: Using Git Repository
-
-1. **Push your code to Git** (GitHub/GitLab/etc.)
-
-2. **In Coolify Dashboard:**
-   - Click **"+ New Resource"**
-   - Select **"Docker Compose"** or **"Dockerfile"**
-   - Connect your Git repository
-   - Set branch: `main`
-   - Set build context: `deepfake-text-detector`
-   - Set Dockerfile path: `Dockerfile`
-
-3. **Configure Environment:**
-   - No environment variables needed for basic setup
-   - Optional: Add `LOG_LEVEL=debug` for verbose logging
-
-4. **Configure Ports:**
-   - Internal Port: `8000`
-   - Public Port: `8000` (or your preferred port)
-
-5. **Storage (Important!):**
-   - Add a volume mount:
-     - Source: `/path/to/your/saved_models` (on your VPS)
-     - Destination: `/app/saved_models`
-     - Read-only: ✅
-
-6. **GPU Support (Optional):**
-   - If your VPS has GPU, add in Docker settings:
-     ```yaml
-     deploy:
-       resources:
-         reservations:
-           devices:
-             - driver: nvidia
-               count: 1
-               capabilities: [gpu]
-     ```
-
-7. **Click "Deploy"**
-
-#### Option B: Using Docker Compose
-
-1. **Upload files to your VPS:**
-   ```bash
-   rsync -avz --exclude 'data/' --exclude 'archive/' \
-     deepfake-text-detector/ user@your-vps:/home/user/deepfake-backend/
-   ```
-
-2. **In Coolify:**
-   - Click **"+ New Resource"**
-   - Select **"Docker Compose"**
-   - Paste your `docker-compose.yml` content
-   - Set working directory: `/home/user/deepfake-backend`
-   - Click **"Deploy"**
-
-### 4️⃣ Update Frontend Configuration
-
-Once deployed, get your backend URL from Coolify (e.g., `https://api.yourdomain.com`)
-
-Update your frontend to point to this URL:
-
-```typescript
-// In your frontend .env or config
-VITE_API_URL=https://api.yourdomain.com
-```
-
-Or update directly in your API client:
-
-```typescript
-const API_BASE_URL = 'https://api.yourdomain.com';
-
-const detectText = async (text: string) => {
-  const response = await fetch(`${API_BASE_URL}/detect`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text })
-  });
-  return response.json();
-};
-```
-
----
-
-## 📋 API Endpoints
-
-### `GET /health`
-Health check endpoint.
-
-**Response:**
+Response:
 ```json
 {
-  "status": "ok",
-  "service": "deepfake-text-detector",
-  "available_models": ["detector_mercor_ai_Qwen_Qwen2.5-0.5B_layer22_svm.pkl"],
-  "gpu_available": true
-}
-```
-
-### `POST /detect`
-Detect if text is AI-generated.
-
-**Request:**
-```json
-{
-  "text": "Your text here",
-  "model_name": "Qwen/Qwen2.5-0.5B",
-  "layer": 22,
-  "pooling": "mean",
-  "classifier_type": "svm",
-  "dataset_name": "mercor_ai"
-}
-```
-
-**Response:**
-```json
-{
-  "prediction": 0,
+  "text": "This is a test sentence.",
   "probability": 0.23,
-  "confidence": 0.54,
-  "is_fake": false,
-  "model_info": {
-    "model_name": "Qwen/Qwen2.5-0.5B",
-    "layer": 22,
-    "pooling": "mean",
-    "classifier": "svm",
-    "dataset": "mercor_ai",
-    "device": "cuda"
-  }
+  "label": "real",
+  "confidence": 0.77
 }
 ```
 
-### `POST /detect-pair`
-Detect which text in a pair is real.
+### Batch Predict
 
-**Request:**
-```json
-{
-  "text1": "First text",
-  "text2": "Second text",
-  "model_name": "Qwen/Qwen2.5-0.5B",
-  "layer": 22
-}
-```
-
-**Response:**
-```json
-{
-  "real_text_id": 1,
-  "text1_prediction": 0,
-  "text2_prediction": 1,
-  "text1_probability": 0.2,
-  "text2_probability": 0.8,
-  "confidence": 0.6
-}
-```
-
-### `GET /models`
-List available models.
-
-**Response:**
-```json
-{
-  "available_models": ["detector_mercor_ai_Qwen_Qwen2.5-0.5B_layer22_svm.pkl"],
-  "cached_models": ["mercor_ai_Qwen_Qwen2.5-0.5B_layer22_svm"],
-  "cached_extractors": ["Qwen/Qwen2.5-0.5B"]
-}
-```
-
----
-
-## 🔧 Troubleshooting
-
-### Models not found
 ```bash
-# Check if models directory exists in container
-docker exec deepfake-text-backend ls -la /app/saved_models/
-
-# If empty, verify volume mount in Coolify
-# Or copy models manually:
-docker cp ./saved_models/. deepfake-text-backend:/app/saved_models/
+curl -X POST https://detector.example.com/batch_predict \
+  -H "Content-Type: application/json" \
+  -d '{"texts": ["Text 1", "Text 2", ...]}'
 ```
+
+## Monitoring
+
+In Coolify dashboard:
+- **Logs** – Check for errors
+- **Metrics** – CPU, memory, request count
+- **Health** – Auto-restart on crash
+
+## Troubleshooting
+
+### Model not found
+
+- Ensure `saved_models/model.pkl` exists in repo
+- Or mount external volume with models
+- Check logs: `docker logs <container>`
 
 ### Out of memory
-```bash
-# Reduce model cache or use smaller models
-# In Coolify, increase memory limit:
-# Settings → Resources → Memory Limit → 8GB
-```
 
-### GPU not detected
-```bash
-# Verify NVIDIA Docker runtime
-nvidia-smi
-docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
+- Reduce `BATCH_SIZE` env var
+- Use `DEVICE=cpu` instead of GPU
+- Ensure Coolify has enough memory allocated
 
-# Enable GPU in docker-compose.yml (see example above)
-```
+### Slow startup
 
-### Slow first request
-This is normal - first request loads the model into memory (cold start).
-Subsequent requests are faster. Consider:
-- Using smaller models
-- Pre-warming cache with a startup script
-- Keeping containers running (avoid frequent restarts)
+- Large models take time to load
+- Coolify health check timeout may be too short; increase if possible
+- Use smaller models (e.g., 4B instead of 70B)
+
+## Advanced: Scaling
+
+For high-traffic deployments:
+1. **Increase replicas** in Coolify (horizontal scaling)
+2. **Load balancer** (Coolify includes one) distributes requests
+3. **GPU shared** across replicas (if using GPU)
 
 ---
 
-## 🎯 Production Checklist
-
-- [ ] Trained models exist in `saved_models/`
-- [ ] Docker image builds successfully
-- [ ] Health check passes locally
-- [ ] Volume mount configured in Coolify
-- [ ] CORS origins restricted to your frontend domain
-- [ ] HTTPS enabled (Coolify handles this)
-- [ ] Monitoring/logging configured
-- [ ] Backup strategy for trained models
-- [ ] Consider using smaller/quantized models for faster inference
-- [ ] Set up automatic restarts on failure
-
----
-
-## 📊 Performance Tips
-
-1. **Model Selection**: Smaller models = faster inference
-   - `Qwen/Qwen2.5-0.5B` is fast
-   - `Llama-3.1-8B` is more accurate but slower
-
-2. **Caching**: Models are cached after first load
-   - First request: ~10-30s
-   - Subsequent requests: ~1-3s
-
-3. **Batching**: Process multiple texts together (TODO: implement batch endpoint)
-
-4. **GPU**: Significantly faster than CPU
-   - Ensure GPU is available and configured
-
-5. **Workers**: Use multiple workers for high traffic
-   ```bash
-   CMD ["uvicorn", "api.app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
-   ```
-
----
-
-## 🔐 Security Notes
-
-- Limit text input size (currently 10,000 chars max)
-- Use CORS restrictions in production
-- Consider rate limiting
-- Monitor resource usage
-- Keep dependencies updated
-
----
-
-## 📝 Environment Variables (Optional)
-
-You can customize behavior with these env vars:
-
-```bash
-LOG_LEVEL=info          # Logging level (debug, info, warning, error)
-MAX_WORKERS=1           # Number of workers (1 for GPU, multiple for CPU)
-MODEL_CACHE_SIZE=5      # Number of models to keep in memory
-DEVICE=cuda             # Force device (cuda or cpu)
-```
-
----
-
-## 🆘 Need Help?
-
-Check logs in Coolify:
-1. Go to your service
-2. Click "Logs" tab
-3. Look for errors during startup or requests
-
-Common issues:
-- **Model not found**: Check volume mount and model files
-- **CUDA out of memory**: Use smaller models or reduce batch size
-- **Connection refused**: Check port configuration in Coolify
-- **CORS errors**: Update CORS origins in `api/app.py`
+See [README.md](./README.md) for local development and [ARCHITECTURE.md](./ARCHITECTURE.md) for system design.

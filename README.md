@@ -384,11 +384,6 @@ We welcome contributions! Please follow these steps:
 4. **Push** to the branch (`git push origin feature/amazing-feature`)
 5. **Open** a Pull Request
 
-### Development Guidelines
-- Write unit tests for new features
-- Follow existing code style (black formatting)
-- Update documentation for new capabilities
-- Test on both CPU and GPU environments
 
 ## 📄 License & Citation
 
@@ -409,11 +404,6 @@ If you use this framework in your research, please cite:
 ```
 
 ## 🔗 Related Work & Resources
-
-### Research Papers
-- [Ensemble Methods for AI Text Detection](https://arxiv.org/abs/example)
-- [Cross-Domain Generalization in Fake Text Detection](https://arxiv.org/abs/example)
-- [Persistent Homology for Text Analysis](https://arxiv.org/abs/example)
 
 ### Datasets
 - **ESA Challenge**: European Space Agency AI detection challenge
