@@ -86,3 +86,4 @@ htmlcov/
 *.tmp
 tmp/
 temp/
+deploy_to_vps.sh
