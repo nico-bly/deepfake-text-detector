@@ -37,10 +37,14 @@ def run_cross_dataset_evaluation(args):
     print(f"  Analysis Type: {metadata.get('analysis_type', 'Unknown')}")
     print(f"  Model: {metadata.get('model_name', 'Unknown')}")
     print(f"  Classifier: {metadata.get('classifier_type', 'Unknown')}")
-    if metadata.get('layer'):
-        print(f"  Layer: {metadata.get('layer')}")
-    if metadata.get('pooling'):
-        print(f"  Pooling: {metadata.get('pooling')}")
+    use_specialized = bool(metadata.get('use_specialized_extraction', False))
+    if use_specialized:
+        print(f"  Extraction: specialized (model-recommended method)")
+    else:
+        if metadata.get('layer'):
+            print(f"  Layer: {metadata.get('layer')}")
+        if metadata.get('pooling'):
+            print(f"  Pooling: {metadata.get('pooling')}")
     
     # Evaluate on each dataset
     results = {}
