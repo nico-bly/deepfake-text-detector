@@ -1,12 +1,11 @@
-# Launch Guide for Deepfake Text Detection Scripts
+# Train & Evaluate Guide for Deepfake Text Detectors
 
-This document provides comprehensive examples for running all the scripts in this deepfake text detection project.
+This guide focuses on training classifiers on a dataset and loading/evaluating them later. A short Mercor challenge section is kept for convenience.
 
 ## 📁 Project Structure
 
 The main scripts are located in the `scripts/` directory:
 
-- **`main_submission_esa.py`**: ESA challenge submission pipeline
 - **`main_submission_mercor.py`**: Mercor AI challenge submission pipeline  
 - **`parameter_sweep_mercor.py`**: Hyperparameter optimization with k-fold CV
 - **`train_and_save_detector.py`**: Train models and save for later use
@@ -46,107 +45,6 @@ When using `--analysis_type embedding`, set `--pooling` to control how token emb
 Notes:
 - All pooling works per-layer. Select the layer with `--layer`.
 - For embeddings, the downstream detector applies StandardScaler + PCA(0.95) by default, so higher-dimensional poolings are reduced automatically.
-
----
-
-## 1. ESA Challenge Submission (`main_submission_esa.py`)
-
-Generate submissions for the ESA challenge using paired text data.
-
-### Basic Usage
-
-```bash
-python scripts/main_submission_esa.py \
-  --model_name "Qwen/Qwen2.5-0.5B" \
-  --train_path data/data_esa/train \
-  --train_labels_path data/data_esa/train.csv \
-  --test_path data/data_esa/test \
-  --analysis_type embedding \
-  --layer 22 \
-  --pooling mean \
-  --classifier_type neural \
-  --device cuda:0
-```
-
-### Examples by Analysis Type
-
-#### Embedding Analysis
-```bash
-# Small model, middle layer
-python scripts/main_submission_esa.py \
-  --model_name "Qwen/Qwen2.5-0.5B" \
-  --analysis_type embedding \
-  --layer 22 \
-  --pooling mean \
-  --classifier_type svm \
-  --train_path data/data_esa/train \
-  --train_labels_path data/data_esa/train.csv \
-  --test_path data/data_esa/test \
-  --device cuda:0
-
-# Mean+Std pooling (richer first-order stats)
-python scripts/main_submission_esa.py \
-  --model_name "Qwen/Qwen2.5-0.5B" \
-  --analysis_type embedding \
-  --layer 22 \
-  --pooling mean_std \
-  --classifier_type svm \
-  --train_path data/data_esa/train \
-  --train_labels_path data/data_esa/train.csv \
-  --test_path data/data_esa/test \
-  --device cuda:0
-
-# Covariance pooling (second-order stats; may be heavy on large hidden sizes)
-# Tip: set COV_MAX_HIDDEN=1024 (default) to cap feature size; otherwise the diagonal variance is used when hidden_size > cap.
-python scripts/main_submission_esa.py \
-  --model_name "Qwen/Qwen2.5-0.5B" \
-  --analysis_type embedding \
-  --layer 22 \
-  --pooling statistical \
-  --classifier_type lr \
-  --train_path data/data_esa/train \
-  --train_labels_path data/data_esa/train.csv \
-  --test_path data/data_esa/test \
-  --device cuda:0
-
-# Large model, final layers
-python scripts/main_submission_esa.py \
-  --model_name "meta-llama/Llama-3.1-8B" \
-  --analysis_type embedding \
-  --layer 30 \
-  --pooling max \
-  --classifier_type neural \
-  --train_path data/data_esa/train \
-  --train_labels_path data/data_esa/train.csv \
-  --test_path data/data_esa/test \
-  --batch_size 4 \
-  --device cuda:0
-```
-
-#### Perplexity Analysis
-```bash
-python scripts/main_submission_esa.py \
-  --model_name "Qwen/Qwen2.5-0.5B" \
-  --analysis_type perplexity \
-  --classifier_type lr \
-  --train_path data/data_esa/train \
-  --train_labels_path data/data_esa/train.csv \
-  --test_path data/data_esa/test \
-  --device cuda:0
-```
-
-#### PHD (Persistent Homological Dimension) Analysis
-```bash
-python scripts/main_submission_esa.py \
-  --model_name "FacebookAI/roberta-base" \
-  --analysis_type phd \
-  --layer 6 \
-  --classifier_type lr \
-  --train_path data/data_esa/train \
-  --train_labels_path data/data_esa/train.csv \
-  --test_path data/data_esa/test \
-  --device cuda:0
-```
 
 ---
 
@@ -382,28 +280,29 @@ Qwen/Qwen3-8B
 
 ```bash
 python scripts/train_and_save_detector.py \
-  --model_name "Qwen/Qwen3-8B" \
+  --model_name "Qwen/Qwen2.5-0.5B" \
   --analysis_type embedding \
   --classifier_type lr \
-  --layer 30 \
-  --pooling mean \
+  --layer 16 \
+  --pooling mean_std \
   --dataset_name human_ai \
   --train_data_path data/data_human/AI_Human.csv \
   --text_column text \
-  --sample_frac 0.01 \
+  --n_rows 8000 \
   --label_column generated \
   --batch_size 8 \
   --device cuda:0 \
   --memory_efficient \
+  --stratified_sample \
   --log_memory
 ```
 
 ```bash
 # Mean+Std pooling
 python scripts/train_and_save_detector.py \
-  --model_name "Qwen/Qwen2.5-0.5B" \
+  --model_name "sentence-transformers/paraphrase-multilingual-mpnet-base-v2" \
   --analysis_type embedding \
-  --classifier_type svm \
+  --classifier_type lr \
   --layer 20 \
   --pooling mean_std \
   --dataset_name human_ai \
@@ -654,6 +553,7 @@ done
 --model_name "Qwen/Qwen3-8B"
 --model_name "meta-llama/Llama-3.1-8B"
 --model_name "Qwen/Qwen3-Embedding-8B"
+--model_name "sentence-transformers/all-mpnet-base-v2"
 
 # Specialized models
 --model_name "FacebookAI/roberta-base"  # Good for PHD analysis
