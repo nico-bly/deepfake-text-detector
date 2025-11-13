@@ -29,7 +29,7 @@ mkdir -p "$SAVE_DIR" "$EVAL_DIR"
 
 # Search space (edit as needed)
 MODELS=(
-  "Qwen/Qwen3-Embedding-4B"
+  "sentence-transformers/all-MiniLM-L6-v2"
 )
 
 # Fallback layers if no per-model override provided
@@ -41,18 +41,21 @@ LAYER_DEFAULTS=(3 4 5)
 
 POOLINGS=(mean last mean_std)
 #POOLINGS=(statistical)
-CLFS=(ocsvm iforest elliptic)
-#CLFS=(svm)
+CLFS=(svm lr)
+#CLFS=(lr)
 # Normalization sweep: 0 = no normalization, 1 = L2 normalize token embeddings before pooling
 NORMALIZES=(0 1)
 # Per-model layer overrides (edit entries as needed)
 declare -A LAYERS_MAP=(
-  ["Qwen/Qwen3-Embedding-4B"]="1 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33"
+  ["sentence-transformers/all-MiniLM-L6-v2"]="0 1 2 3 4 5"
 )
 
 #["sentence-transformers/paraphrase-multilingual-mpnet-base-v2"]="1 2 3 4 5 6 7 8 9 10 11"
+#["sentence-transformers/all-mpnet-base-v2"]="1 2 3 4 5 6 7 8 9 10 11"
 #  ["microsoft/deberta-v3-large"]="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23"
 # ["Qwen/Qwen2.5-0.5B"]="5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 23"
+#["Qwen/Qwen3-Embedding-4B"]="1 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33"
+
 # ["microsoft/deberta-v3-large"]="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23"
 #  ["Qwen/Qwen3-Embedding-0.6B"]="10 20"
 #  ["Qwen/Qwen3-8B"]="10 15 20 25 30 -1"
