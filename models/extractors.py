@@ -39,23 +39,41 @@ class EmbeddingExtractor(torch.nn.Module):
         print(f"Loading model: {model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side=padding_side)
 
-        # Force use of safetensors to bypass PyTorch 2.6 security requirement
-        if use_flash_attention and self.device == 'cuda':
-            print("Loading with Flash Attention 2...")
-            self.model = AutoModel.from_pretrained(
+        # Check if this is an encoder-decoder model (e.g., M2M-100, mBART)
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_name)
+        is_encoder_decoder = getattr(config, 'is_encoder_decoder', False)
+        
+        if is_encoder_decoder:
+            print(f"Detected encoder-decoder model. Loading encoder only.")
+            # For encoder-decoder models, load only the encoder
+            from transformers import AutoModel as OriginalAutoModel
+            full_model = OriginalAutoModel.from_pretrained(
                 model_name,
-                torch_dtype=torch.float16,
-                attn_implementation="flash_attention_2",
+                dtype=torch.float16,
                 device_map=None,
                 use_safetensors=True
             )
+            # Extract just the encoder
+            self.model = full_model.encoder
         else:
-            self.model = AutoModel.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16,
-                device_map=None,
-                use_safetensors=True
-            )
+            # Force use of safetensors to bypass PyTorch 2.6 security requirement
+            if use_flash_attention and self.device == 'cuda':
+                print("Loading with Flash Attention 2...")
+                self.model = AutoModel.from_pretrained(
+                    model_name,
+                    dtype=torch.float16,
+                    attn_implementation="flash_attention_2",
+                    device_map=None,
+                    use_safetensors=True
+                )
+            else:
+                self.model = AutoModel.from_pretrained(
+                    model_name,
+                    dtype=torch.float16,
+                    device_map=None,
+                    use_safetensors=True
+                )
         
         self.model = self.model.to(self.device)
         self.model.eval()
@@ -131,6 +149,9 @@ class EmbeddingExtractor(torch.nn.Module):
             with torch.no_grad():
                 outputs = self.model(**model_inputs, output_hidden_states=True)
 
+            # Get hidden states (we now load only encoders, so always use outputs.hidden_states)
+            hidden_states_tuple = outputs.hidden_states
+
             # Memory logging (GPU + CPU) after forward pass
             if self.log_memory and (batch_index % self.memory_interval == 0):
                 self._log_memory_usage(batch_index, len(batch), model_inputs)
@@ -148,7 +169,7 @@ class EmbeddingExtractor(torch.nn.Module):
                         print(f"Text: {repr(batch[b])}")
                         print(attention_mask[b].bool())
 
-                    for layer_idx, hidden_state in enumerate(outputs.hidden_states):
+                    for layer_idx, hidden_state in enumerate(hidden_states_tuple):
                         
                         # Keep full sequence, no pooling
                         valid_tokens = hidden_state[b][valid_indices]
@@ -262,6 +283,7 @@ class EmbeddingExtractor(torch.nn.Module):
                     # Some models may not accept output_attentions kwarg
                     outputs = self.model(**model_inputs, output_hidden_states=True)
 
+            # Get hidden states (we now load only encoders, so always use outputs.hidden_states)
             hidden_states = outputs.hidden_states
             if layer_idx >= len(hidden_states):
                 raise ValueError(f"Requested layer_idx={layer_idx} but only {len(hidden_states)} hidden states returned")
