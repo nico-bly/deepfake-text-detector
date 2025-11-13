@@ -19,6 +19,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from models.extractors import EmbeddingExtractor, pool_embeds_from_layer, TFIDFExtractor
 from models.text_features import PerplexityCalculator, TextIntrinsicDimensionCalculator
 from models.classifiers import BinaryDetector, OutlierDetections
+from models.specialized_extractors import get_specialized_extractor
 import torch.nn.functional as F
 
 
@@ -77,17 +78,35 @@ def get_features(texts: List[str], extractor, args, show_progress: bool = True):
 
     Memory efficient embedding path: if args.memory_efficient is True and analysis_type=embedding,
     we call extractor.get_pooled_layer_embeddings to avoid materializing every layer & sequence.
-    Normalization can now be applied directly in the memory-efficient path.
+    
+    Specialized extraction: if args.use_specialized_extraction is True and the model has a 
+    specialized extractor (e.g., Qwen embedding models, Sentence-Transformers), use that instead.
     """
     processed_texts = sanitize_texts(texts)
     print(f"Extracting features for {len(processed_texts)} texts...")
 
+    # Check if we should use specialized extraction
+    if (args.analysis_type == "embedding" and 
+        getattr(args, 'use_specialized_extraction', False)):
+        spec_extractor = get_specialized_extractor(args.model_name, args.device)
+        if spec_extractor is not None:
+            print(f"Using specialized extraction for {args.model_name}")
+            print("  (No layer selection, pooling, or PCA - using model's recommended method)")
+            features = spec_extractor.extract(
+                processed_texts,
+                batch_size=args.batch_size,
+                max_length=args.max_length
+            )
+            return features
+        else:
+            print(f"⚠️  No specialized extractor found for {args.model_name}. Falling back to generic extraction.")
+
     if args.analysis_type == "embedding":
         if getattr(args, 'memory_efficient', False):
-            # Memory-efficient path: can apply normalization directly
-            normalize_flag = getattr(args, 'normalize', False)
-            print(f"Using memory-efficient single-layer pooled extraction path" + 
-                  (f" with L2 normalization" if normalize_flag else "."))
+            print("Using memory-efficient single-layer pooled extraction path.")
+            normalize = getattr(args, 'normalize', False)
+            if normalize:
+                print("  With L2 normalization post-pooling.")
             features = extractor.get_pooled_layer_embeddings(
                 processed_texts,
                 layer_idx=args.layer,
@@ -95,19 +114,20 @@ def get_features(texts: List[str], extractor, args, show_progress: bool = True):
                 batch_size=args.batch_size,
                 max_length=args.max_length,
                 show_progress=show_progress,
-                normalize=normalize_flag,
+                normalize=normalize,
             )
         else:
-            # Full embeddings path (loads all layers, more memory-intensive)
             embeds_all = extractor.get_all_layer_embeddings(
                 processed_texts,
                 batch_size=args.batch_size,
                 max_length=args.max_length,
                 show_progress=show_progress,
             )
+            # Determine valid layer index
             available_layers = sorted(list(embeds_all[0].keys())) if embeds_all else []
             chosen_layer = args.layer
             if chosen_layer not in available_layers:
+                # Fallback to last available layer
                 if available_layers:
                     fallback = available_layers[-1]
                     print(f"⚠️  Requested layer {chosen_layer} not available. Using last available layer {fallback}.")
@@ -186,8 +206,12 @@ def generate_model_name(args, dataset_name: str) -> str:
         return s or "model"
 
     if args.analysis_type == "embedding":
-        norm_tag = "_l2norm" if getattr(args, 'normalize', False) else ""
-        feature_type = f"embedding_layer{args.layer}_{args.pooling}{norm_tag}"
+        # Check if using specialized extraction (no layer/pooling tuning)
+        if getattr(args, 'use_specialized_extraction', False):
+            feature_type = "specialized_embedding"
+        else:
+            norm_tag = "_l2norm" if getattr(args, 'normalize', False) else ""
+            feature_type = f"embedding_layer{args.layer}_{args.pooling}{norm_tag}"
     elif args.analysis_type == "perplexity":
         feature_type = "perplexity"
     elif args.analysis_type == "phd":
@@ -221,12 +245,20 @@ def save_detector_and_metadata(detector: BinaryDetector, args, save_dir: Path, m
         'layer': getattr(args, 'layer', None),
         'pooling': getattr(args, 'pooling', None),
         'normalize': getattr(args, 'normalize', False),
+        'use_specialized_extraction': getattr(args, 'use_specialized_extraction', False),
         'batch_size': args.batch_size,
         'max_length': args.max_length,
         'validation_split': args.validation_split,
         'dataset_used': args.dataset_name,
         'text_column': args.text_column,
         'label_column': args.label_column,
+        # Data loading/sampling provenance
+        'n_rows': getattr(args, 'n_rows', None),
+        'sample_frac': getattr(args, 'sample_frac', None),
+        'stratified_sample': getattr(args, 'stratified_sample', False),
+        'random_state': getattr(args, 'random_state', None),
+        'train_size': getattr(args, 'train_size', None),
+        'train_label_counts': getattr(args, 'train_label_counts', None),
     }
 
     if args.analysis_type == "tfidf":
@@ -261,32 +293,12 @@ def save_detector_and_metadata(detector: BinaryDetector, args, save_dir: Path, m
         except Exception as e:
             print(f"⚠️  Warning: failed to save TF-IDF vectorizer: {e}")
 
-def load_human_ai_dataset(data_path: str, n_rows: int = None, stratified: bool = False, random_state: int = 42) -> Tuple[List[str], np.ndarray]:
-    """Load Human vs AI dataset, optionally with balanced class sampling.
-    
-    Args:
-        data_path: Path to the CSV file
-        n_rows: Maximum rows to load
-        stratified: If True and n_rows specified, sample n_rows/2 from each class (0/1)
-        random_state: Random seed for stratified sampling
-    
-    Returns:
-        Tuple of (texts list, labels numpy array)
-    """
-    df = pd.read_csv(data_path)
-    
-    if stratified and n_rows:
-        # Sample n_rows/2 from each class (0 and 1) for balanced 50/50
-        n_per_class = n_rows // 2
-        df_0 = df[df['generated'] == 0].sample(n=min(n_per_class, len(df[df['generated'] == 0])), random_state=random_state)
-        df_1 = df[df['generated'] == 1].sample(n=min(n_per_class, len(df[df['generated'] == 1])), random_state=random_state)
-        df = pd.concat([df_0, df_1], ignore_index=True)
-        print(f"Loaded {len(df)} samples (stratified: {len(df_0)} real + {len(df_1)} fake)")
-    elif n_rows:
-        df = df.head(n_rows)
-    
-    texts = df['text'].tolist()
-    labels = df['generated'].values
+
+def load_human_ai_dataset(data_path: str, n_rows: int = None) -> Tuple[List[str], np.ndarray]:
+    """Load the AI_Human.csv dataset with optional row limiting."""
+    df = pd.read_csv(data_path, nrows=n_rows)
+    texts = sanitize_texts(df['text'].astype(str).tolist())
+    labels = df['generated'].astype(int).to_numpy()  # 0=human, 1=AI
     return texts, labels
 
 
@@ -309,20 +321,11 @@ def _resolve_daigtv2_csv_path(data_path: str) -> Path:
     raise FileNotFoundError(f"Could not find DAIGT v2 CSV at {data_path}")
 
 
-def load_daigtv2_dataset(data_path: str, n_rows: int = None, stratified: bool = False, random_state: int = 42) -> Tuple[List[str], np.ndarray]:
+def load_daigtv2_dataset(data_path: str, n_rows: int = None) -> Tuple[List[str], np.ndarray]:
     """Load the DAIGT v2 dataset.
 
     Expected columns: 'text' (string), 'label' (0/1). Additional columns are ignored.
     The function accepts a direct CSV path or a directory containing the CSV.
-    
-    Args:
-        data_path: Path to CSV or directory containing the CSV
-        n_rows: Maximum rows to load
-        stratified: If True and n_rows specified, sample n_rows/2 from each class (0/1)
-        random_state: Random seed for stratified sampling
-    
-    Returns:
-        Tuple of (texts list, labels numpy array)
     """
     csv_path = _resolve_daigtv2_csv_path(data_path)
     df = pd.read_csv(csv_path, nrows=n_rows)
@@ -330,22 +333,9 @@ def load_daigtv2_dataset(data_path: str, n_rows: int = None, stratified: bool = 
         raise ValueError(
             f"DAIGT v2 CSV must contain 'text' and 'label' columns. Found: {list(df.columns)}"
         )
-    
-    # Coerce label to int {0,1} early so we can stratify
-    labels_col = pd.to_numeric(df['label'], errors='coerce').fillna(0).astype(int)
-    df['_label_int'] = labels_col
-    
-    if stratified and n_rows:
-        # Sample n_rows/2 from each class for balanced 50/50
-        n_per_class = n_rows // 2
-        df_0 = df[df['_label_int'] == 0].sample(n=min(n_per_class, len(df[df['_label_int'] == 0])), random_state=random_state)
-        df_1 = df[df['_label_int'] == 1].sample(n=min(n_per_class, len(df[df['_label_int'] == 1])), random_state=random_state)
-        df = pd.concat([df_0, df_1], ignore_index=True)
-        print(f"Loaded {len(df)} samples (stratified: {len(df_0)} class-0 + {len(df_1)} class-1)")
-    
     texts = sanitize_texts(df['text'].astype(str).tolist())
     # Some DAIGT releases may have label as bool/str; coerce to int {0,1}
-    labels = df['_label_int'].to_numpy()
+    labels = pd.to_numeric(df['label'], errors='coerce').fillna(0).astype(int).to_numpy()
     return texts, labels
 
 
@@ -410,25 +400,15 @@ def train_detector(train_texts: List[str], train_labels: np.ndarray, args) -> Tu
 
 def run_training_pipeline(args):
     """Main training pipeline."""
-    # Extract common parameters
-    stratified = getattr(args, 'stratified_sample', False)
-    random_state = getattr(args, 'random_state', 42)
-    
     # Load training data
     if args.dataset_name == "human_ai":
         train_texts, train_labels = load_human_ai_dataset(
-            args.train_data_path, 
-            n_rows=getattr(args, 'n_rows', None),
-            stratified=stratified,
-            random_state=random_state
+            args.train_data_path, n_rows=getattr(args, 'n_rows', None)
         )
     elif args.dataset_name in {"daigtv2", "daigt_v2", "daigt"}:
         # Dedicated loader with fixed columns
         train_texts, train_labels = load_daigtv2_dataset(
-            args.train_data_path, 
-            n_rows=getattr(args, 'n_rows', None),
-            stratified=stratified,
-            random_state=random_state
+            args.train_data_path, n_rows=getattr(args, 'n_rows', None)
         )
     else:
         # For other datasets, load from CSV with specified columns
@@ -455,17 +435,6 @@ def run_training_pipeline(args):
                 f"Could not infer text/label columns. Available columns: {list(train_df.columns)}.\n"
                 f"Pass --text_column and --label_column explicitly."
             )
-        
-        # Apply stratified sampling if requested (balanced 50/50 per class)
-        if stratified and getattr(args, 'n_rows', None):
-            n_rows = getattr(args, 'n_rows', None)
-            n_per_class = n_rows // 2
-            label_col_int = pd.to_numeric(train_df[label_col], errors='coerce').fillna(0).astype(int)
-            df_0 = train_df[label_col_int == 0].sample(n=min(n_per_class, len(train_df[label_col_int == 0])), random_state=random_state)
-            df_1 = train_df[label_col_int == 1].sample(n=min(n_per_class, len(train_df[label_col_int == 1])), random_state=random_state)
-            train_df = pd.concat([df_0, df_1], ignore_index=True)
-            print(f"Loaded {len(train_df)} samples (stratified: {len(df_0)} class-0 + {len(df_1)} class-1)")
-        
         train_texts = sanitize_texts(train_df[text_col].astype(str).tolist())
         train_labels = pd.to_numeric(train_df[label_col], errors='coerce').fillna(0).astype(int).to_numpy()
 
@@ -486,11 +455,18 @@ def run_training_pipeline(args):
         ) if len(np.unique(train_labels)) > 1 else df_tmp.sample(frac=frac, random_state=getattr(args, 'random_state', 42))
 
         train_texts = sampled['text'].tolist()
-        train_labels = sampled['label'].astype(int).to_numpy()
+        train_labels = sampled['label'].to_numpy()
 
-    # Ensure labels are int64 for np.bincount
-    train_labels = train_labels.astype(int) if train_labels.dtype != np.int64 else train_labels
-    
+    # Persist basic dataset stats for reproducibility in saved metadata
+    args.train_size = len(train_texts)
+    try:
+        label_counts = np.bincount(train_labels).tolist()
+    except Exception:
+        # Fallback in case labels are not integer-typed for any reason
+        unique, counts = np.unique(train_labels, return_counts=True)
+        label_counts = {int(k): int(v) for k, v in zip(unique, counts)}
+    args.train_label_counts = label_counts
+
     print(f"Training on {len(train_texts)} samples from {args.dataset_name} dataset")
     print(f"Label distribution: {np.bincount(train_labels)} (0=real, 1=fake)")
 
@@ -548,13 +524,17 @@ if __name__ == "__main__":
     parser.add_argument("--validation_split", type=float, default=0.2, help="Validation split ratio for BinaryDetector")
     parser.add_argument("--memory_efficient", action="store_true", help="Use memory-efficient single-layer pooled extraction for embeddings")
     parser.add_argument("--normalize", action="store_true", help="L2-normalize token embeddings before pooling (embedding analysis only)")
+    parser.add_argument("--use_specialized_extraction", action="store_true", 
+                        help="Use model-specific extraction method (if available) instead of layer/pooling/PCA. "
+                             "Supported models: Qwen3-Embedding-*, sentence-transformers/*, xlm-roberta-*, roberta-*. "
+                             "Ignores --layer, --pooling, --normalize flags.")
     parser.add_argument("--log_memory", action="store_true", help="Print memory usage during embedding extraction")
     parser.add_argument("--memory_log_interval", type=int, default=1, help="Batches between memory log prints")
 
     # Data subsampling options for large CSVs
     parser.add_argument("--n_rows", type=int, default=None, help="Read only the first N rows from CSV (for quick tests)")
     parser.add_argument("--sample_frac", type=float, default=None, help="Optionally sample a fraction of rows after loading (0<frac<=1)")
-    parser.add_argument("--stratified_sample", action="store_true", help="When loading training data with --n_rows, sample balanced classes (50/50 real/fake)")
+    parser.add_argument("--stratified_sample", action="store_true", help="When loading with --n_rows, sample balanced classes (50/50 real/fake)")
     parser.add_argument("--random_state", type=int, default=42, help="Random seed for sampling")
 
     # TF-IDF specific parameters
