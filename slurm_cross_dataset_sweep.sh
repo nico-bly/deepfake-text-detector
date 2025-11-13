@@ -20,8 +20,10 @@ echo "Node: $(hostname)"
 "$PYTHON" --version
 
 # Example: delete saved models after Mercor evaluation to save space
-DELETE_AFTER_EVAL=1 \
-PYTHON="$PYTHON" \
-MEM_EFF="--memory_efficient" \
-DEVICE=cuda:0 \
-bash scripts/run_cross_dataset_sweep.sh
+export DELETE_AFTER_EVAL=1
+export PYTHON="$PYTHON"
+export MEM_EFF="--memory_efficient"
+export DEVICE=cuda:0
+
+# bash scripts/run_cross_dataset_sweep.sh
+bash scripts/run_specialized_embedding_sweep.sh
