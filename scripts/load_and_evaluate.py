@@ -153,27 +153,58 @@ def get_features_from_metadata(texts: List[str], extractor, metadata: Dict[str, 
     layer = metadata.get('layer', 22)
     pooling = metadata.get('pooling', 'mean')
     normalize = bool(metadata.get('normalize', False))
+    use_specialized = bool(metadata.get('use_specialized_extraction', False))
     
     print(f"Extracting {analysis_type} features for {len(processed_texts)} texts...")
     
     if analysis_type == "embedding":
-        embeds_all = extractor.get_all_layer_embeddings(
-            processed_texts,
-            batch_size=batch_size,
-            max_length=max_length,
-            show_progress=show_progress,
-        )
-        # Be robust to layer index if not available
-        available_layers = sorted(list(embeds_all[0].keys())) if embeds_all else []
-        chosen_layer = layer
-        if chosen_layer not in available_layers and available_layers:
-            fallback = available_layers[-1]
-            print(f"⚠️  Requested layer {chosen_layer} not available. Using last available layer {fallback}.")
-            chosen_layer = fallback
-        layer_embeds = [embeds[chosen_layer] for embeds in embeds_all]
-        if normalize:
-            layer_embeds = [F.normalize(torch.from_numpy(e), p=2, dim=1).numpy() for e in layer_embeds]
-        features = pool_embeds_from_layer(layer_embeds, pooling=pooling)
+        # For specialized extraction, use the extractor's default method (no layer selection)
+        if use_specialized:
+            print("Using specialized extraction (no layer selection)")
+            extractor_name = metadata.get('model_name', '')
+            if 'sentence-transformers' in extractor_name or 'Qwen' in extractor_name:
+                # Use the specialized extraction method for embedding models
+                from models.specialized_extractors import get_specialized_extractor
+                spec_ext = get_specialized_extractor(extractor_name)
+                features = spec_ext.extract(
+                    processed_texts,
+                    batch_size=batch_size,
+                    max_length=max_length,
+                )
+            else:
+                # Fallback to full embeddings from last layer
+                embeds_all = extractor.get_all_layer_embeddings(
+                    processed_texts,
+                    batch_size=batch_size,
+                    max_length=max_length,
+                    show_progress=show_progress,
+                )
+                available_layers = sorted(list(embeds_all[0].keys())) if embeds_all else []
+                if available_layers:
+                    last_layer = available_layers[-1]
+                    layer_embeds = [embeds[last_layer] for embeds in embeds_all]
+                    features = pool_embeds_from_layer(layer_embeds, pooling='mean')
+                else:
+                    raise ValueError("No layers available from extractor")
+        else:
+            # Regular embedding extraction with layer/pooling tuning
+            embeds_all = extractor.get_all_layer_embeddings(
+                processed_texts,
+                batch_size=batch_size,
+                max_length=max_length,
+                show_progress=show_progress,
+            )
+            # Be robust to layer index if not available
+            available_layers = sorted(list(embeds_all[0].keys())) if embeds_all else []
+            chosen_layer = layer
+            if chosen_layer not in available_layers and available_layers:
+                fallback = available_layers[-1]
+                print(f"⚠️  Requested layer {chosen_layer} not available. Using last available layer {fallback}.")
+                chosen_layer = fallback
+            layer_embeds = [embeds[chosen_layer] for embeds in embeds_all]
+            if normalize:
+                layer_embeds = [F.normalize(torch.from_numpy(e), p=2, dim=1).numpy() for e in layer_embeds]
+            features = pool_embeds_from_layer(layer_embeds, pooling=pooling)
 
     elif analysis_type == "perplexity":
         features = np.array(
