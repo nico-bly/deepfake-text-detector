@@ -24,92 +24,56 @@ class ModelConfig(BaseSettings):
     model_config = {"from_attributes": True}
 
 
+from pydantic_settings import BaseSettings
+from typing import List
+from functools import lru_cache
+
 class Settings(BaseSettings):
-    """Main application settings"""
+    # ===== Server Configuration =====
+    API_HOST: str = "0.0.0.0"
+    API_PORT: int = 8000
+    API_BASE_URL: str = "http://localhost:8000"
+    API_ROOT_PATH: str = ""
     
-    # Server
-    WORKERS: int = int(os.getenv("WORKERS", "2"))
-    THREADS_PER_WORKER: int = int(os.getenv("THREADS_PER_WORKER", "2"))
-    MAX_QUEUE_SIZE: int = int(os.getenv("MAX_QUEUE_SIZE", "100"))
-    
-    # Inference backend strategy
-    DEFAULT_INFERENCE_BACKEND: InferenceBackend = InferenceBackend.LOCAL
-    ALLOW_CLIENT_SIDE_INFERENCE: bool = True
-    ALLOW_MODAL_INFERENCE: bool = False  # Disable by default (requires API key)
-    
-    # CORS
+    # ===== CORS Configuration =====
     ALLOWED_ORIGINS: List[str] = [
         "http://localhost:3000",
-        "http://localhost:5173",  # Vite dev server
-        "https://your-frontend-domain.com"
+        "http://localhost:8000",
+        "http://127.0.0.1:3000",
     ]
     
-    # Redis (for task queuing)
-    REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
-    REDIS_ENABLED: bool = os.getenv("REDIS_ENABLED", "false").lower() == "true"
+    # ===== Server Settings =====
+    PYTHONUNBUFFERED: bool = True
+    LOG_LEVEL: str = "info"
+    WORKERS: int = 4
+    THREADS_PER_WORKER: int = 1
     
-    # Modal configuration (if using Modal backend)
-    MODAL_TOKEN_ID: str = os.getenv("MODAL_TOKEN_ID", "")
-    MODAL_TOKEN_SECRET: str = os.getenv("MODAL_TOKEN_SECRET", "")
-    MODAL_WORKSPACE: str = os.getenv("MODAL_WORKSPACE", "deepfake-detection")
+    # ===== Inference Backend Configuration =====
+    DEFAULT_INFERENCE_BACKEND: str = "local"  # local, modal, client
+    ALLOW_CLIENT_SIDE_INFERENCE: bool = True
+    ALLOW_MODAL_INFERENCE: bool = False
     
-    # Model configuration
-    AVAILABLE_MODELS: dict = {
-        # Tiny models (good for client-side)
-        "tiny-tfidf": ModelConfig(
-            model_id="embedding_A__mercor_ai",
-            size_category="tiny",
-            preferred_backend=InferenceBackend.CLIENT_SIDE,
-            fallback_backends=[InferenceBackend.LOCAL]
-        ),
-        
-        # Small models (good for VPS with modest resources)
-        "small-perplexity": ModelConfig(
-            model_id="perplexity_base",
-            size_category="small",
-            preferred_backend=InferenceBackend.LOCAL,
-            fallback_backends=[InferenceBackend.MODAL]
-        ),
-        
-        # Medium models (requires GPU or Modal)
-        "medium-embedding": ModelConfig(
-            model_id="embedding_qwen_22",
-            size_category="medium",
-            preferred_backend=InferenceBackend.LOCAL,
-            fallback_backends=[InferenceBackend.MODAL]
-        ),
-        
-        # Large models (best on Modal)
-        "large-multilayer": ModelConfig(
-            model_id="multilayer_ensemble",
-            size_category="large",
-            preferred_backend=InferenceBackend.MODAL,
-            fallback_backends=[InferenceBackend.LOCAL]
-        ),
-    }
+    # ===== VPS Hardware Configuration =====
+    VPS_GPU_MEMORY_GB: int = 0
+    VPS_CPU_MEMORY_GB: int = 8
+    MAX_VPS_INFERENCE_SIZE: str = "medium"  # tiny, small, medium
     
-    # Hardware constraints on VPS
-    MAX_VPS_INFERENCE_SIZE: Literal["tiny", "small", "medium"] = "medium"
-    VPS_GPU_MEMORY_GB: int = int(os.getenv("VPS_GPU_MEMORY_GB", "0"))  # 0 = no GPU
-    VPS_CPU_MEMORY_GB: int = int(os.getenv("VPS_CPU_MEMORY_GB", "4"))
+    # ===== Redis Configuration =====
+    REDIS_ENABLED: bool = False
+    REDIS_URL: str = "redis://redis:6379/0"
+    MAX_QUEUE_SIZE: int = 100
     
-    # Request constraints
-    MAX_TEXT_LENGTH: int = 10000
-    MIN_TEXT_LENGTH: int = 1
-    MAX_BATCH_SIZE: int = 8
-    REQUEST_TIMEOUT_SECONDS: int = 30
+    # ===== Model Configuration =====
+    DEFAULT_MODEL_ID: str = "sentence-transformers_all-MiniLM-L6-v2"
+    SAVED_MODELS_DIR: str = "saved_models"
     
-    # Logging
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "info")
-    
-    model_config = {
-        "env_file": ".env",
-        "case_sensitive": True
-    }
+    class Config:
+        env_file = ".env"
+        case_sensitive = False  # Allow lowercase env vars
+        extra = "ignore"  # Ignore extra env vars (don't raise error)
 
-
+@lru_cache()
 def get_settings() -> Settings:
-    """Get settings instance (singleton)"""
     return Settings()
 
 
