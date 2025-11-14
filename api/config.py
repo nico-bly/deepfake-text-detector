@@ -3,8 +3,10 @@ Configuration management with support for multiple inference backends.
 Supports: VPS-local, Modal, Client-side
 """
 from pydantic_settings import BaseSettings
-from typing import List, Literal
+from pydantic import Field
+from typing import List, Literal, Optional, Dict, Any
 from enum import Enum
+from functools import lru_cache
 import os
 
 class InferenceBackend(str, Enum):
@@ -14,19 +16,20 @@ class InferenceBackend(str, Enum):
     CLIENT_SIDE = "client"   # Run on client (send metadata only)
 
 
-class ModelConfig(BaseSettings):
+class ModelConfig:
     """Model size and backend selection"""
-    model_id: str  # e.g., "embedding_A__mercor_ai" 
-    size_category: Literal["tiny", "small", "medium", "large"]  # Size classification
-    preferred_backend: InferenceBackend = InferenceBackend.LOCAL
-    fallback_backends: List[InferenceBackend] = [InferenceBackend.LOCAL]
-    
-    model_config = {"from_attributes": True}
+    def __init__(
+        self,
+        model_id: str,
+        size_category: Literal["tiny", "small", "medium", "large"],
+        preferred_backend: InferenceBackend = InferenceBackend.LOCAL,
+        fallback_backends: Optional[List[InferenceBackend]] = None,
+    ):
+        self.model_id = model_id
+        self.size_category = size_category
+        self.preferred_backend = preferred_backend
+        self.fallback_backends = fallback_backends or [InferenceBackend.LOCAL]
 
-
-from pydantic_settings import BaseSettings
-from typing import List
-from functools import lru_cache
 
 class Settings(BaseSettings):
     # ===== Server Configuration =====
@@ -67,13 +70,47 @@ class Settings(BaseSettings):
     DEFAULT_MODEL_ID: str = "sentence-transformers_all-MiniLM-L6-v2"
     SAVED_MODELS_DIR: str = "saved_models"
     
+    # ===== Modal Configuration (Required by InferenceRouter) =====
+    MODAL_ENABLED: bool = False
+    MODAL_TOKEN_ID: Optional[str] = None
+    MODAL_TOKEN_SECRET: Optional[str] = None
+    MODAL_WORKSPACE: Optional[str] = None
+    
+    # ===== Available Models Registry =====
+    AVAILABLE_MODELS: Dict[str, ModelConfig] = {}
+    
     class Config:
         env_file = ".env"
-        case_sensitive = False  # Allow lowercase env vars
-        extra = "ignore"  # Ignore extra env vars (don't raise error)
+        case_sensitive = False
+        extra = "ignore"
+    
+    def __init__(self, **data):
+        super().__init__(**data)
+        # Initialize available models if empty
+        if not self.AVAILABLE_MODELS:
+            self._init_default_models()
+    
+    def _init_default_models(self):
+        """Initialize default model configurations"""
+        self.AVAILABLE_MODELS = {
+            "sentence-transformers_all-MiniLM-L6-v2": ModelConfig(
+                model_id="sentence-transformers_all-MiniLM-L6-v2",
+                size_category="small",
+                preferred_backend=InferenceBackend.LOCAL,
+                fallback_backends=[InferenceBackend.LOCAL, InferenceBackend.CLIENT_SIDE],
+            ),
+            "sentence-transformers_all-mpnet-base-v2": ModelConfig(
+                model_id="sentence-transformers_all-mpnet-base-v2",
+                size_category="medium",
+                preferred_backend=InferenceBackend.LOCAL,
+                fallback_backends=[InferenceBackend.LOCAL],
+            ),
+        }
+
 
 @lru_cache()
 def get_settings() -> Settings:
+    """Get singleton settings instance"""
     return Settings()
 
 
