@@ -146,7 +146,7 @@ def instantiate_extractor_from_metadata(metadata: Dict[str, Any], device: str = 
 
 def get_features_from_metadata(texts: List[str], extractor, metadata: Dict[str, Any], 
                               batch_size: int = 8, max_length: int = 512, 
-                              show_progress: bool = True) -> np.ndarray:
+                              show_progress: bool = True, device: str = "cuda:0") -> np.ndarray:
     """Extract features using the same parameters as during training."""
     processed_texts = sanitize_texts(texts)
     analysis_type = metadata.get('analysis_type', 'embedding')
@@ -162,10 +162,10 @@ def get_features_from_metadata(texts: List[str], extractor, metadata: Dict[str, 
         if use_specialized:
             print("Using specialized extraction (no layer selection)")
             extractor_name = metadata.get('model_name', '')
-            if 'sentence-transformers' in extractor_name or 'Qwen' in extractor_name:
-                # Use the specialized extraction method for embedding models
-                from models.specialized_extractors import get_specialized_extractor
-                spec_ext = get_specialized_extractor(extractor_name)
+            # Try to get specialized extractor for all models (not just sentence-transformers/Qwen)
+            from models.specialized_extractors import get_specialized_extractor
+            spec_ext = get_specialized_extractor(extractor_name, device=device)
+            if spec_ext is not None:
                 features = spec_ext.extract(
                     processed_texts,
                     batch_size=batch_size,
@@ -338,7 +338,7 @@ def evaluate_detector_on_dataset(detector: BinaryDetector, metadata: Dict[str, A
     # Extract features
     features = get_features_from_metadata(
         texts, extractor, metadata, batch_size=batch_size, 
-        max_length=max_length, show_progress=True
+        max_length=max_length, show_progress=True, device=device
     )
     features = replace_nan_with_column_means(features)
     
