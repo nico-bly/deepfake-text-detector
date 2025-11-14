@@ -76,6 +76,15 @@ class Settings(BaseSettings):
     MODAL_TOKEN_SECRET: Optional[str] = None
     MODAL_WORKSPACE: Optional[str] = None
     
+    # ===== Text Validation =====
+    MIN_TEXT_LENGTH: int = 1
+    MAX_TEXT_LENGTH: int = 10000
+    
+    # ===== Request/Response Configuration =====
+    MAX_BATCH_SIZE: int = 100
+    REQUEST_TIMEOUT_SECONDS: int = 300
+    ENABLE_BATCH_ENDPOINT: bool = True
+    
     # ===== Available Models Registry =====
     AVAILABLE_MODELS: Dict[str, ModelConfig] = {}
     
