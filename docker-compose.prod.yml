@@ -1,0 +1,149 @@
+version: '3.8'
+
+# Production-ready docker-compose for VPS deployment
+# Supports: Local inference, Modal integration, Client-side preparation
+
+services:
+  # ========================================================================
+  # Main API service
+  # ========================================================================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    container_name: deepfake-api
+    restart: unless-stopped
+    
+    # Resource limits (adjust to VPS capacity)
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'        # Adjust based on VPS cores
+          memory: 8G         # Adjust based on VPS RAM
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+    
+    environment:
+      # Server config
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=info
+      - WORKERS=4
+      - THREADS_PER_WORKER=1
+      
+      # Inference backend configuration
+      - DEFAULT_INFERENCE_BACKEND=local
+      - ALLOW_CLIENT_SIDE_INFERENCE=true
+      - ALLOW_MODAL_INFERENCE=false  # Set to true if using Modal
+      
+      # VPS Hardware info (for routing decisions)
+      - VPS_GPU_MEMORY_GB=0           # Set to GPU memory if available
+      - VPS_CPU_MEMORY_GB=8           # Total CPU RAM
+      - MAX_VPS_INFERENCE_SIZE=medium # tiny, small, or medium
+      
+      # Redis (optional, for task queuing)
+      - REDIS_ENABLED=false
+      - REDIS_URL=redis://redis:6379/0
+      
+      # Model configuration (optional)
+      - LOG_LEVEL=info
+    
+    ports:
+      - "8000:8000"
+    
+    volumes:
+      # Mount saved models (read-only for production)
+      - ./saved_models:/app/saved_models:ro
+      # Mount logs (writable)
+      - ./logs:/app/logs
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    # Optional: Redis dependency
+    depends_on:
+      - redis
+    
+    networks:
+      - deepfake-net
+    
+    # Uncomment for GPU support (requires nvidia-docker and nvidia-runtime)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+
+  # ========================================================================
+  # Redis for task queuing (optional)
+  # ========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: deepfake-redis
+    restart: unless-stopped
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    
+    ports:
+      - "6379:6379"
+    
+    volumes:
+      - redis-data:/data
+    
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+    
+    networks:
+      - deepfake-net
+    
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+
+  # ========================================================================
+  # Optional: Nginx reverse proxy
+  # ========================================================================
+  # Uncomment if you want to add caching, rate limiting, etc.
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: deepfake-nginx
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  #     - ./certs:/etc/nginx/certs:ro
+  #   depends_on:
+  #     - api
+  #   networks:
+  #     - deepfake-net
+
+
+volumes:
+  redis-data:
+    driver: local
+
+networks:
+  deepfake-net:
+    driver: bridge
