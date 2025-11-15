@@ -3,6 +3,8 @@ Production-ready FastAPI backend for deepfake text detection.
 Supports: Local VPS inference, Modal serverless, and client-side inference.
 """
 import logging
+import sys
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
@@ -22,13 +24,41 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 router = InferenceRouter(settings)
 
-# Initialize FastAPI
+
+# ============================================================================
+# Lifespan event handlers
+# ============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events"""
+    # Startup
+    logger.info("=" * 50)
+    logger.info("Deepfake Detection API Starting")
+    logger.info("=" * 50)
+    logger.info(f"Settings:")
+    logger.info(f"  Default backend: {settings.DEFAULT_INFERENCE_BACKEND}")
+    logger.info(f"  Allow client-side: {settings.ALLOW_CLIENT_SIDE_INFERENCE}")
+    logger.info(f"  Allow Modal: {settings.ALLOW_MODAL_INFERENCE}")
+    logger.info(f"  Redis enabled: {settings.REDIS_ENABLED}")
+    logger.info(f"  VPS GPU memory: {settings.VPS_GPU_MEMORY_GB}GB")
+    logger.info(f"  VPS CPU memory: {settings.VPS_CPU_MEMORY_GB}GB")
+    logger.info("=" * 50)
+    
+    yield
+    
+    # Shutdown
+    logger.info("Deepfake Detection API shutting down")
+
+
+# Initialize FastAPI with lifespan
 app = FastAPI(
     title="Deepfake Detection API",
     description="Multi-backend inference system for AI-generated text detection",
     version="2.0.0",
     docs_url="/docs",
-    openapi_url="/openapi.json"
+    openapi_url="/openapi.json",
+    lifespan=lifespan
 )
 
 # Add CORS middleware
@@ -368,26 +398,7 @@ async def get_stats():
     }
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Startup event"""
-    logger.info("=" * 50)
-    logger.info("Deepfake Detection API Starting")
-    logger.info("=" * 50)
-    logger.info(f"Settings:")
-    logger.info(f"  Default backend: {settings.DEFAULT_INFERENCE_BACKEND.value}")
-    logger.info(f"  Allow client-side: {settings.ALLOW_CLIENT_SIDE_INFERENCE}")
-    logger.info(f"  Allow Modal: {settings.ALLOW_MODAL_INFERENCE}")
-    logger.info(f"  Redis enabled: {settings.REDIS_ENABLED}")
-    logger.info(f"  VPS GPU memory: {settings.VPS_GPU_MEMORY_GB}GB")
-    logger.info(f"  VPS CPU memory: {settings.VPS_CPU_MEMORY_GB}GB")
-    logger.info("=" * 50)
 
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Shutdown event"""
-    logger.info("Deepfake Detection API shutting down")
 
 
 # Error handlers
@@ -406,11 +417,24 @@ async def http_exception_handler(request, exc):
 
 if __name__ == "__main__":
     import uvicorn
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Deepfake Detection API")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8000, help="Port to bind to (default: 8000)")
+    parser.add_argument("--workers", type=int, default=None, help="Number of workers (default: from settings)")
+    parser.add_argument("--log-level", default=None, help="Log level (default: from settings)")
+    
+    args = parser.parse_args()
+    
+    port = args.port
+    workers = args.workers or settings.WORKERS
+    log_level = args.log_level or settings.LOG_LEVEL
     
     uvicorn.run(
-        "app:app",
-        host="0.0.0.0",
-        port=8000,
-        workers=settings.WORKERS,
-        log_level=settings.LOG_LEVEL,
+        "api.app_v2:app",
+        host=args.host,
+        port=port,
+        workers=workers,
+        log_level=log_level,
     )
