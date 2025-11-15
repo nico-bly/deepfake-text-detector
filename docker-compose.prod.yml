@@ -14,20 +14,9 @@ services:
     container_name: deepfake-api
     restart: unless-stopped
     
-    # Resource limits (adjust to VPS capacity)
-    deploy:
-      resources:
-        limits:
-          cpus: '4.0'        # Adjust based on VPS cores
-          memory: 8G         # Adjust based on VPS RAM
-        reservations:
-          cpus: '1.0'
-          memory: 2G
-    
     environment:
       # Server config
       - PYTHONUNBUFFERED=1
-      - LOG_LEVEL=info
       - WORKERS=4
       - THREADS_PER_WORKER=1
       
@@ -49,7 +38,7 @@ services:
       - LOG_LEVEL=info
     
     ports:
-      - "8000:8000"
+      - "3333:8000"
     
     volumes:
       # Mount saved models (read-only for production)
@@ -70,15 +59,6 @@ services:
     
     networks:
       - deepfake-net
-    
-    # Uncomment for GPU support (requires nvidia-docker and nvidia-runtime)
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
 
 
   # ========================================================================
@@ -88,15 +68,6 @@ services:
     image: redis:7-alpine
     container_name: deepfake-redis
     restart: unless-stopped
-    
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 512M
-        reservations:
-          cpus: '0.25'
-          memory: 256M
     
     ports:
       - "6379:6379"
@@ -147,3 +118,4 @@ volumes:
 networks:
   deepfake-net:
     driver: bridge
+
