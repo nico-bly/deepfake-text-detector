@@ -23,6 +23,8 @@ wheels/
 .installed.cfg
 *.egg
 
+.env
+.gitignore
 # Jupyter Notebook
 .ipynb_checkpoints
 *.ipynb
