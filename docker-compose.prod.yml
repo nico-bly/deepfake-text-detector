@@ -36,9 +36,14 @@ services:
       
       # Model configuration (optional)
       - LOG_LEVEL=info
+
+      # Security - API Key & CORS
+      - API_KEY=${API_KEY}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
     
-    ports:
-      - "3333:8000"
+    
+    expose: 
+      - "8000"
     
     volumes:
       # Mount saved models (read-only for production)
@@ -69,8 +74,8 @@ services:
     container_name: deepfake-redis
     restart: unless-stopped
     
-    ports:
-      - "6379:6379"
+    expose:
+      - "6379"
     
     volumes:
       - redis-data:/data
@@ -92,21 +97,25 @@ services:
 
 
   # ========================================================================
-  # Optional: Nginx reverse proxy
+  # Optional: Nginx reverse proxy (for rate limiting, security, caching)
   # ========================================================================
-  # Uncomment if you want to add caching, rate limiting, etc.
+  # Uncomment this section to add Nginx as reverse proxy
   # nginx:
   #   image: nginx:alpine
   #   container_name: deepfake-nginx
   #   restart: unless-stopped
+  #   
   #   ports:
   #     - "80:80"
   #     - "443:443"
+  #   
   #   volumes:
   #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
   #     - ./certs:/etc/nginx/certs:ro
+  #   
   #   depends_on:
   #     - api
+  #   
   #   networks:
   #     - deepfake-net
 
