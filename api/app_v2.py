@@ -4,10 +4,12 @@ Supports: Local VPS inference, Modal serverless, and client-side inference.
 """
 import logging
 import sys
+import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 from pathlib import Path
@@ -23,6 +25,28 @@ logger = logging.getLogger(__name__)
 # Initialize settings and router
 settings = get_settings()
 router = InferenceRouter(settings)
+
+# ============================================================================
+# Security - API Key Authentication
+# ============================================================================
+
+# Get API key from environment
+API_KEY = os.getenv("API_KEY", "your-super-secret-api-key-here")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def verify_api_key(api_key: str = Depends(api_key_header)) -> str:
+    """Verify API key from X-API-Key header"""
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Missing API key. Include X-API-Key header in request."
+        )
+    if api_key != API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API key"
+        )
+    return api_key
 
 
 # ============================================================================
@@ -209,15 +233,18 @@ async def get_backends_info():
 
 
 @app.post("/predict", response_model=DetectionResponse, tags=["inference"])
-async def predict(request: DetectionRequest):
+async def predict(request: DetectionRequest, api_key: str = Depends(verify_api_key)):
     """
     Detect if text is AI-generated or human-written.
+    
+    Requires X-API-Key header for authentication.
     
     Automatically routes to the best backend based on model configuration
     and system resources.
     
     Example:
         POST /predict
+        Headers: X-API-Key: your-api-key
         {
             "text": "This is some text to analyze",
             "model_id": "small-perplexity"
@@ -280,10 +307,13 @@ async def predict(request: DetectionRequest):
 async def batch_predict(
     texts: List[str],
     model_id: str,
-    prefer_backend: Optional[IBackend] = None
+    prefer_backend: Optional[IBackend] = None,
+    api_key: str = Depends(verify_api_key)
 ):
     """
     Batch prediction (multiple texts at once).
+    
+    Requires X-API-Key header for authentication.
     
     Useful for processing multiple texts efficiently.
     """
