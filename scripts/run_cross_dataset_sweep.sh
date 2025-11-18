@@ -41,15 +41,18 @@ LAYER_DEFAULTS=(3 4 5)
 
 POOLINGS=(mean last mean_std)
 #POOLINGS=(statistical)
-CLFS=(svm lr)
-#CLFS=(lr)
+#CLFS=(lr svm)
+CLFS=(ocsvm elliptic)
 # Normalization sweep: 0 = no normalization, 1 = L2 normalize token embeddings before pooling
 NORMALIZES=(0 1)
 # Per-model layer overrides (edit entries as needed)
 declare -A LAYERS_MAP=(
-  ["sentence-transformers/all-MiniLM-L6-v2"]="0 1 2 3 4 5"
+ ["sentence-transformers/all-MiniLM-L6-v2"]="0 1 2 3 4 5"
 )
 
+#  ["sentence-transformers/use-cmlm-multilingual"]="0 1 2 3 4 5 6 7 8 9 10 11"
+# ["Qwen/Qwen3-1.7B"]="5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 23 24 25 26 27"
+# ["sentence-transformers/all-MiniLM-L6-v2"]="0 1 2 3 4 5 6 7 8 9 10 11"
 #["sentence-transformers/paraphrase-multilingual-mpnet-base-v2"]="1 2 3 4 5 6 7 8 9 10 11"
 #["sentence-transformers/all-mpnet-base-v2"]="1 2 3 4 5 6 7 8 9 10 11"
 #  ["microsoft/deberta-v3-large"]="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23"
@@ -153,10 +156,13 @@ for model in "${MODELS[@]}"; do
         echo "Using model: $MODEL_PATH"
 
         # Evaluate on Mercor AI training set (will write summary to $SUMMARY_PATH)
+        # Use threshold optimization to fix domain shift issues with SVM
         "${ENV_PREFIX[@]}" "$PYTHON_BIN" scripts/cross_dataset_evaluation.py \
           --model_path "$MODEL_PATH" \
           --datasets mercor_ai:"$MERCOR_CSV" \
           --device "$DEVICE" \
+          --optimize_threshold f1 \
+          --optimize_split 0.2 \
           --save_summary \
           --output_dir "$EVAL_DIR"
 

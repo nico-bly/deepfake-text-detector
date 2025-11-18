@@ -25,5 +25,5 @@ export PYTHON="$PYTHON"
 export MEM_EFF="--memory_efficient"
 export DEVICE=cuda:0
 
-# bash scripts/run_cross_dataset_sweep.sh
-bash scripts/run_specialized_embedding_sweep.sh
+bash scripts/run_cross_dataset_sweep.sh
+#bash scripts/run_specialized_embedding_sweep.sh
