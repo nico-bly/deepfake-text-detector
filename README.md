@@ -110,26 +110,89 @@ deepfake-text-detector/
 │   ├── data_loader.py           # Unified dataloaders, pair reconstruction
 │   ├── utils.py                 # General utilities
 │   └── utils_esa.py             # ESA-specific utilities
-├── scripts/                   # Execution scripts
-│   ├── main_submission_esa.py   # ESA challenge pipeline
-│   ├── main_submission_mercor.py# Mercor AI challenge pipeline
+├── api/                       # Production FastAPI server
+│   ├── app_v2.py                # Main FastAPI application
+│   ├── inference.py             # Inference engine for trained models
+│   ├── model_mapping.py         # Maps dataset+model_id to backend files
+│   ├── config.py                # API configuration
+│   └── test_api.py              # API testing utilities
+├── scripts/                   # Training & experimentation scripts
+│   ├── main_submission_esa.py   # ESA challenge training pipeline
+│   ├── main_submission_mercor.py# Mercor AI challenge training pipeline
 │   ├── parameter_sweep_mercor.py# Hyperparameter optimization
-│   ├── train_and_save_detector.py# Model training & persistence
-│   ├── load_and_evaluate.py     # Model evaluation
+│   ├── train_and_save_detector.py# Train & save detector models
+│   ├── load_and_evaluate.py     # Model evaluation tools
 │   ├── cross_dataset_evaluation.py# Cross-dataset analysis
-│   └── launch.md                # Complete usage documentation
+│   └── launch.md                # Complete training documentation
 ├── notebooks/                 # Jupyter analysis notebooks
 │   └── kaggle_competition_submission.ipynb
-├── data/                      # Dataset directories
-│   ├── data_esa/                # ESA challenge data
-│   ├── mercor-ai/               # Mercor AI challenge data
-│   ├── data_human/              # Human vs AI datasets
-│   └── data_arxiv/              # ArXiv datasets
-├── saved_models/              # Trained model artifacts
-├── results/                   # Experiment results
+├── data/                      # Training dataset directories
+│   ├── data_esa/                # ESA challenge training data
+│   ├── mercor-ai/               # Mercor AI challenge training data
+│   ├── data_human/              # Human vs AI training datasets
+│   └── data_arxiv/              # ArXiv training datasets
+├── saved_models/              # Trained model artifacts (training output)
+├── saved_models_prod/         # Production-ready models (for deployment)
+├── results/                   # Training experiment results
 ├── evaluation_results/        # Cross-validation metrics
+├── Dockerfile                 # Docker image for production API
+├── docker-compose.yml         # Local Docker deployment
+├── docker-compose.prod.yml    # Production Docker deployment
 └── test_pooling.py            # Unit tests
 ```
+
+## Training vs Production
+
+### Training Scripts
+The `scripts/` directory contains Python scripts designed for **training and experimenting** with text detection models:
+- Use these to train new detectors on your datasets
+- Perform hyperparameter optimization and parameter sweeps
+- Evaluate models across different datasets
+- Generate cross-validation metrics and results
+
+**Example**: Train a Qwen model on the Mercor dataset:
+```bash
+python scripts/main_submission_mercor.py \
+  --model_name "Qwen/Qwen2.5-0.5B" \
+  --analysis_type embedding \
+  --layer 22 \
+  --pooling mean \
+  --train_csv data/mercor-ai/train.csv \
+  --test_csv data/mercor-ai/test.csv \
+  --device cuda:0
+```
+
+### Production Deployment
+Once you have trained models (saved in `saved_models_prod/`), deploy them using the **FastAPI server** with Docker:
+
+1. **Copy trained models** to `saved_models_prod/`:
+   ```bash
+   cp saved_models/trained_model.pkl saved_models_prod/
+   cp saved_models/trained_model_metadata.pkl saved_models_prod/
+   ```
+
+2. **Configure model mappings** in `api/model_mapping.py` to expose your models via the API
+
+3. **Start the API server** with Docker:
+   ```bash
+   docker-compose up -d
+   # or for production
+   docker-compose -f docker-compose.prod.yml up -d
+   ```
+
+4. **Make predictions** via the HTTP API:
+   ```bash
+   curl -X POST http://localhost:8008/predict \
+     -H "X-API-Key: your-api-key" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "text": "Your text to analyze",
+       "dataset": "human-ai-binary",
+       "model_id": "qwen-0.5b"
+     }'
+   ```
+
+The API abstracts away backend model filenames, allowing clients to simply specify a `dataset` and `model_id` parameter.
 
 ## How It Works
 
