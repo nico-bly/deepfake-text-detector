@@ -206,9 +206,9 @@ class LocalInferenceEngine(BaseInferenceEngine):
             with open(metadata_path, "rb") as f:
                 metadata = pickle.load(f)
         
-        # Extract features based on analysis type
+        # Extract features based on analysis type using proper extractors
         analysis_type = metadata.get("analysis_type", "embedding")
-        features = self._extract_features(text, metadata, analysis_type)
+        features = self._extract_features_properly(text, metadata, analysis_type)
         
         # Make prediction
         results = detector.predict(features, return_probabilities=True, return_distances=False)
@@ -237,20 +237,90 @@ class LocalInferenceEngine(BaseInferenceEngine):
             }
         )
     
-    def _extract_features(self, text: str, metadata: Dict[str, Any], analysis_type: str):
-        """Extract features based on analysis type"""
-        # Simplified feature extraction
-        # In production, you'd use the actual extractor classes
+    def _extract_features_properly(self, text: str, metadata: Dict[str, Any], analysis_type: str):
+        """Extract features using the same method as during training"""
+        import torch.nn.functional as F
+        from models.extractors import pool_embeds_from_layer
         
-        if analysis_type == "tfidf":
-            # Use cached vectorizer
-            return np.random.randn(1, 100)  # Placeholder
+        # Sanitize text
+        processed_text = text if text and text.strip() else " "
         
-        elif analysis_type == "embedding":
-            return np.random.randn(1, 768)  # Placeholder
+        if analysis_type == "embedding":
+            # Get extraction parameters from metadata
+            model_name = metadata.get("model_name", "Qwen/Qwen2.5-0.5B")
+            layer = metadata.get("layer", 16)
+            pooling = metadata.get("pooling", "mean")
+            normalize = metadata.get("normalize", False)
+            batch_size = metadata.get("batch_size", 16)
+            max_length = metadata.get("max_length", 512)
+            use_specialized = metadata.get("use_specialized_extraction", False)
+            
+            # Create extractor if not cached
+            if model_name not in self.extractor_cache:
+                logger.info(f"Creating EmbeddingExtractor for {model_name}")
+                self.extractor_cache[model_name] = self.EmbeddingExtractor(
+                    model_name=model_name,
+                    device="cuda" if self.torch.cuda.is_available() else "cpu"
+                )
+            
+            extractor = self.extractor_cache[model_name]
+            
+            # Extract embeddings using get_pooled_layer_embeddings (more efficient)
+            try:
+                # Use the memory-efficient pooled extraction
+                features = extractor.get_pooled_layer_embeddings(
+                    texts=[processed_text],
+                    layer_idx=layer,
+                    pooling=pooling,
+                    batch_size=1,
+                    max_length=max_length,
+                    show_progress=False,
+                    normalize=normalize
+                )
+                return features
+            except Exception as e:
+                logger.error(f"Feature extraction failed: {e}")
+                raise
+        
+        elif analysis_type == "perplexity":
+            model_name = metadata.get("model_name", "Qwen/Qwen2.5-0.5B")
+            max_length = metadata.get("max_length", 512)
+            
+            if model_name not in self.extractor_cache:
+                logger.info(f"Creating PerplexityCalculator for {model_name}")
+                self.extractor_cache[model_name] = self.PerplexityCalculator(
+                    model_name=model_name,
+                    device="cuda" if self.torch.cuda.is_available() else "cpu"
+                )
+            
+            extractor = self.extractor_cache[model_name]
+            perplexity = extractor.calculate_perplexity(processed_text, max_length=max_length)
+            return np.array([[perplexity]])
+        
+        elif analysis_type == "phd":
+            model_name = metadata.get("model_name", "Qwen/Qwen2.5-0.5B")
+            layer = metadata.get("layer", 16)
+            max_length = metadata.get("max_length", 512)
+            
+            if model_name not in self.extractor_cache:
+                logger.info(f"Creating TextIntrinsicDimensionCalculator for {model_name}")
+                self.extractor_cache[model_name] = self.TextIntrinsicDimensionCalculator(
+                    model_name=model_name,
+                    layer=layer,
+                    device="cuda" if self.torch.cuda.is_available() else "cpu"
+                )
+            
+            extractor = self.extractor_cache[model_name]
+            phd_value = extractor.calculate([processed_text], max_length=max_length)[0]
+            return np.array([[phd_value]])
+        
+        elif analysis_type == "tfidf":
+            # For TF-IDF, we need the vectorizer that was fitted during training
+            # It should be loaded with the detector or stored separately
+            raise NotImplementedError("TF-IDF inference not yet implemented - requires fitted vectorizer")
         
         else:
-            return np.random.randn(1, 1)  # Placeholder
+            raise ValueError(f"Unknown analysis_type: {analysis_type}")
 
 
 class ModalInferenceEngine(BaseInferenceEngine):
@@ -444,14 +514,19 @@ class InferenceRouter:
         model_config = self.settings.AVAILABLE_MODELS.get(model_id)
         if not model_config:
             logger.warning(f"Unknown model: {model_id}, using default backend")
-            preferred = prefer_backend or self.settings.DEFAULT_INFERENCE_BACKEND
-            fallbacks = [self.settings.DEFAULT_INFERENCE_BACKEND]
+            # Convert string to enum if needed
+            default_backend = self.settings.DEFAULT_INFERENCE_BACKEND
+            if isinstance(default_backend, str):
+                default_backend = InferenceBackend(default_backend)
+            preferred = prefer_backend or default_backend
+            fallbacks = [default_backend]
         else:
             preferred = prefer_backend or model_config.preferred_backend
             fallbacks = model_config.fallback_backends
         
         # Try preferred backend
-        logger.info(f"Attempting prediction with {preferred.value} backend for model {model_id}")
+        backend_name = preferred.value if hasattr(preferred, 'value') else str(preferred)
+        logger.info(f"Attempting prediction with {backend_name} backend for model {model_id}")
         result = await self._try_backend(preferred, text, model_id)
         
         if result.error is None:
@@ -462,7 +537,8 @@ class InferenceRouter:
             if fallback == preferred:
                 continue  # Skip already tried
             
-            logger.warning(f"Fallback to {fallback.value} backend (reason: {result.error})")
+            fallback_name = fallback.value if hasattr(fallback, 'value') else str(fallback)
+            logger.warning(f"Fallback to {fallback_name} backend (reason: {result.error})")
             result = await self._try_backend(fallback, text, model_id)
             
             if result.error is None:
