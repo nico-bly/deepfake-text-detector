@@ -1,30 +1,25 @@
 version: '3.8'
 
 services:
-  deepfake-backend:
+  api:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: deepfake-text-backend
+    container_name: deepfake-api
+    restart: unless-stopped
+    
     ports:
-      - "8000:8000"
-    volumes:
-      # Mount saved models directory
-      - ./saved_models:/app/saved_models:ro
-      # Mount logs directory
-      - ./logs:/app/logs
+      - "8008:8000"
+    
     environment:
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=info
-    # Uncomment for GPU support (requires nvidia-docker)
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
-    restart: unless-stopped
+      - API_KEY=${API_KEY}
+    
+    volumes:
+      - ./saved_models_prod:/app/saved_models:ro
+      - ./logs:/app/logs
+    
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
