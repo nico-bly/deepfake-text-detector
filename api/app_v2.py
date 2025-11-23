@@ -17,6 +17,7 @@ import time
 
 from .config import get_settings, InferenceBackend
 from .inference import InferenceRouter, InferenceBackend as IBackend
+from .model_mapping import resolve_model, get_model_info as get_mapping_info, list_all_mappings, get_available_datasets, validate_combination
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -102,7 +103,8 @@ app.add_middleware(
 class DetectionRequest(BaseModel):
     """Request for text detection"""
     text: str = Field(..., min_length=settings.MIN_TEXT_LENGTH, max_length=settings.MAX_TEXT_LENGTH)
-    model_id: str = Field(..., description="Model identifier")
+    model_id: str = Field(..., description="Model identifier (e.g., 'small-perplexity')")
+    dataset: str = Field(..., description="Dataset name (e.g., 'human-ai-binary')")
     prefer_backend: Optional[IBackend] = Field(None, description="Preferred inference backend")
 
 
@@ -179,9 +181,55 @@ async def health_check():
     )
 
 
+@app.get("/models/list", tags=["models"])
+async def list_dataset_models():
+    """List all available dataset + model combinations.
+    
+    Returns a mapping of datasets to available models for each dataset.
+    This is what the frontend should use to populate dropdowns.
+    
+    Example response:
+        {
+            "human-ai-binary": ["small-perplexity", "medium-perplexity", "qwen-0.5b", "qwen-8b"],
+            "human-ai-anomaly": ["small-perplexity", "medium-perplexity", "qwen-0.5b"],
+            "arxiv": ["small-perplexity", "medium-perplexity"],
+            "fakenews": ["small-perplexity", "large-perplexity"]
+        }
+    """
+    result = {}
+    for dataset in get_available_datasets():
+        result[dataset] = list_all_mappings(dataset)
+    return result
+
+
+@app.get("/models/info", tags=["models"])
+async def get_available_models_info():
+    """Get detailed info about all dataset+model combinations.
+    
+    Useful for frontend to show which models are available on which backend.
+    """
+    from .model_mapping import DATASET_MODEL_MAPPING
+    
+    result = {}
+    for (dataset, model_id), mapping in DATASET_MODEL_MAPPING.items():
+        if dataset not in result:
+            result[dataset] = {}
+        result[dataset][model_id] = {
+            "backend_model_file": mapping.backend_model_file,
+            "backend_type": mapping.backend_type.value,
+            "size_mb": mapping.size_mb,
+            "description": mapping.description,
+            "metadata": mapping.metadata or {}
+        }
+    return result
+
+
 @app.get("/models", tags=["models"])
 async def list_models():
-    """List all available models with their configurations"""
+    """List all available models with their configurations
+    
+    Note: Use /models/list for dataset+model combinations or /models/info for details
+    """
     return {
         "configured_models": {
             model_id: {
@@ -195,7 +243,8 @@ async def list_models():
             "local": settings.DEFAULT_INFERENCE_BACKEND == IBackend.LOCAL,
             "modal": settings.ALLOW_MODAL_INFERENCE,
             "client_side": settings.ALLOW_CLIENT_SIDE_INFERENCE
-        }
+        },
+        "note": "Use /models/list for dataset+model combinations"
     }
 
 
@@ -239,35 +288,46 @@ async def predict(request: DetectionRequest, api_key: str = Depends(verify_api_k
     
     Requires X-API-Key header for authentication.
     
-    Automatically routes to the best backend based on model configuration
-    and system resources.
+    Frontend passes (dataset + model_id), backend resolves to actual model file
+    and automatically routes to the best backend based on model configuration.
     
     Example:
         POST /predict
         Headers: X-API-Key: your-api-key
         {
             "text": "This is some text to analyze",
-            "model_id": "small-perplexity"
+            "model_id": "small-perplexity",
+            "dataset": "human-ai-binary"
         }
     """
     try:
-        # Validate model exists
-        if request.model_id not in settings.AVAILABLE_MODELS:
+        # Resolve dataset + model to backend model file
+        logger.info(f"Prediction request: dataset={request.dataset}, model={request.model_id}")
+        
+        if not validate_combination(request.dataset, request.model_id):
+            available_models = list_all_mappings(request.dataset)
             raise HTTPException(
                 status_code=404,
                 detail={
-                    "error": "Model not found",
+                    "error": "Model combination not found",
+                    "dataset": request.dataset,
                     "model_id": request.model_id,
-                    "available_models": list(settings.AVAILABLE_MODELS.keys())
+                    "available_models_for_dataset": available_models,
+                    "available_datasets": get_available_datasets()
                 }
             )
         
-        # Route to appropriate backend
-        logger.info(f"Prediction request: model={request.model_id}, backend={request.prefer_backend}")
+        # Get mapping info
+        model_info = get_mapping_info(request.dataset, request.model_id)
+        backend_model_id = model_info["backend_model_file"]
+        backend_type = model_info["backend_type"]
         
+        logger.info(f"Resolved to backend model: {backend_model_id} (backend: {backend_type})")
+        
+        # Route to appropriate backend
         result = await router.predict(
             text=request.text,
-            model_id=request.model_id,
+            model_id=backend_model_id,
             prefer_backend=request.prefer_backend
         )
         
@@ -288,9 +348,14 @@ async def predict(request: DetectionRequest, api_key: str = Depends(verify_api_k
             confidence=result.confidence,
             is_fake=result.prediction == 1,
             backend=result.backend.value,
-            model_id=result.model_id,
+            model_id=f"{request.dataset}/{request.model_id}",  # Return original frontend ID
             latency_ms=result.latency_ms,
-            metadata=result.metadata
+            metadata={
+                **result.metadata,
+                "frontend_model_id": request.model_id,
+                "dataset": request.dataset,
+                "backend_model_file": backend_model_id
+            }
         )
     
     except HTTPException:
