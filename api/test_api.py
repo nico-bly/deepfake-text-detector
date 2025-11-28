@@ -1,150 +1,136 @@
-"""
-Test script for the FastAPI backend.
-Run this to verify your API is working correctly.
-"""
-import requests
+"""Minimal test API with proper feature extraction"""
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import logging
 import sys
 from pathlib import Path
+import pickle
+import numpy as np
 
-# Default API URL (adjust if needed)
-API_BASE_URL = "http://localhost:8000"
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-def test_health():
-    """Test health endpoint."""
-    print("\n🔍 Testing /health endpoint...")
-    try:
-        response = requests.get(f"{API_BASE_URL}/health", timeout=10)
-        response.raise_for_status()
-        data = response.json()
+from api.model_mapping_simple import load_model, list_models
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Detector API")
+
+class PredictRequest(BaseModel):
+    text: str
+    model_id: str = "human_ai_microsoft_deberta"
+
+class PredictResponse(BaseModel):
+    prediction: int
+    probability: float
+    confidence: float
+    is_fake: bool
+    model_id: str
+    metadata: dict = {}
+
+def extract_features(text: str, metadata: dict) -> np.ndarray:
+    """Extract features from text using metadata"""
+    # Get analysis type from metadata
+    analysis_type = metadata.get("analysis_type", "embedding")
+    
+    if analysis_type == "embedding":
+        # Use embedding extractor
+        from models.extractors import EmbeddingExtractor
+        model_name = metadata.get("model_name", "Qwen/Qwen2.5-0.5B")
+        layer = metadata.get("layer", 23)
+        pooling = metadata.get("pooling", "mean")
         
-        print("✅ Health check passed!")
-        print(f"   Status: {data['status']}")
-        print(f"   Service: {data['service']}")
-        print(f"   GPU Available: {data['gpu_available']}")
-        print(f"   Available Models: {len(data['available_models'])} found")
+        extractor = EmbeddingExtractor(model_name, device="cpu")  # Use CPU for testing
+        features = extractor.get_pooled_layer_embeddings(
+            [text],
+            layer_idx=layer,
+            pooling=pooling,
+            batch_size=1,
+            show_progress=False
+        )
+        return features
+    
+    elif analysis_type == "perplexity":
+        # Use perplexity calculator
+        from models.text_features import PerplexityCalculator
+        model_name = metadata.get("model_name", "Qwen/Qwen2.5-0.5B")
         
-        if data['available_models']:
-            print("\n   Models:")
-            for model in data['available_models'][:5]:  # Show first 5
-                print(f"     - {model}")
-        else:
-            print("   ⚠️  No models found! Train some models first.")
-            return False
+        calculator = PerplexityCalculator(model_name, device="cpu")
+        perp = calculator.calculate_batch_perplexity([text])
+        features = np.array(perp).reshape(-1, 1)
+        return features
+    
+    elif analysis_type == "phd":
+        # Use intrinsic dimension calculator
+        from models.text_features import TextIntrinsicDimensionCalculator
+        model_name = metadata.get("model_name", "Qwen/Qwen2.5-0.5B")
+        layer = metadata.get("layer", 23)
         
-        return True
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Health check failed: {e}")
-        return False
-
-
-def test_detect():
-    """Test detection endpoint."""
-    print("\n🔍 Testing /detect endpoint...")
+        calculator = TextIntrinsicDimensionCalculator(model_name, device="cpu", layer_idx=layer)
+        phd = calculator.calculate_batch([text])
+        features = np.array(phd).reshape(-1, 1)
+        return features
     
-    test_cases = [
-        {
-            "text": "The quick brown fox jumps over the lazy dog. This is a natural sentence.",
-            "expected": "Should detect as real (human-written)"
-        },
-        {
-            "text": "As an AI language model, I can help you with various tasks. I am designed to assist users with information.",
-            "expected": "Should detect as fake (AI-generated)"
-        }
-    ]
-    
-    for i, test_case in enumerate(test_cases, 1):
-        print(f"\n  Test Case {i}: {test_case['expected']}")
-        print(f"  Text: {test_case['text'][:60]}...")
+    elif analysis_type == "tfidf":
+        # Use TF-IDF vectorizer from metadata
+        model_path = metadata.get("model_path")
+        if not model_path:
+            raise ValueError("TF-IDF requires model_path in metadata")
         
-        try:
-            response = requests.post(
-                f"{API_BASE_URL}/detect",
-                json={"text": test_case["text"]},
-                timeout=30
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            print(f"  ✅ Prediction: {'FAKE' if data['is_fake'] else 'REAL'}")
-            print(f"     Probability (fake): {data['probability']:.2%}")
-            print(f"     Confidence: {data['confidence']:.2%}")
-            print(f"     Model: {data['model_info']['model_name']}")
-            
-        except requests.exceptions.RequestException as e:
-            print(f"  ❌ Detection failed: {e}")
-            return False
-    
-    return True
-
-
-## Pair detection test removed (endpoint no longer supported)
-
-
-def test_models_endpoint():
-    """Test models listing endpoint."""
-    print("\n🔍 Testing /models endpoint...")
-    try:
-        response = requests.get(f"{API_BASE_URL}/models", timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        vec_path = Path(model_path).with_name(Path(model_path).stem + "_vectorizer.pkl")
+        if not vec_path.exists():
+            raise FileNotFoundError(f"Vectorizer not found: {vec_path}")
         
-        print("✅ Models endpoint passed!")
-        print(f"   Available Models: {len(data['available_models'])}")
-        print(f"   Cached Models: {len(data['cached_models'])}")
-        print(f"   Cached Extractors: {len(data['cached_extractors'])}")
+        with open(vec_path, "rb") as f:
+            vectorizer = pickle.load(f)
         
-        return True
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Models endpoint failed: {e}")
-        return False
-
-
-def main():
-    """Run all tests."""
-    print("=" * 60)
-    print("🚀 FastAPI Backend Test Suite")
-    print("=" * 60)
-    print(f"Testing API at: {API_BASE_URL}")
+        features = vectorizer.transform([text])
+        return features.toarray() if hasattr(features, 'toarray') else features
     
-    # Check if server is running
-    try:
-        requests.get(f"{API_BASE_URL}/", timeout=5)
-    except requests.exceptions.RequestException:
-        print("\n❌ Cannot connect to API server!")
-        print(f"   Make sure the server is running at {API_BASE_URL}")
-        print("\n   To start the server:")
-        print("   cd deepfake-text-detector")
-        print("   uvicorn api.app:app --reload")
-        sys.exit(1)
-    
-    # Run tests
-    results = {
-        "Health Check": test_health(),
-        "Detection": test_detect(),
-        "Models Listing": test_models_endpoint()
-    }
-    
-    # Summary
-    print("\n" + "=" * 60)
-    print("📊 Test Summary")
-    print("=" * 60)
-    
-    passed = sum(results.values())
-    total = len(results)
-    
-    for test_name, result in results.items():
-        status = "✅ PASS" if result else "❌ FAIL"
-        print(f"{status} - {test_name}")
-    
-    print(f"\nTotal: {passed}/{total} tests passed")
-    
-    if passed == total:
-        print("\n🎉 All tests passed! Your API is working correctly.")
-        return 0
     else:
-        print(f"\n⚠️  {total - passed} test(s) failed. Check the output above.")
-        return 1
+        raise ValueError(f"Unknown analysis_type: {analysis_type}")
 
+@app.get("/models")
+async def get_models():
+    return {"models": list_models()}
 
-if __name__ == "__main__":
-    sys.exit(main())
+@app.post("/predict", response_model=PredictResponse)
+async def predict(request: PredictRequest):
+    try:
+        # Load model and metadata
+        detector, metadata = load_model(request.model_id)
+        logger.info(f"Model loaded: {request.model_id}")
+        logger.info(f"Metadata: {metadata}")
+        
+        # Extract features from text
+        logger.info(f"Extracting features from text (length: {len(request.text)})")
+        features = extract_features(request.text, metadata)
+        logger.info(f"Features shape: {features.shape}")
+        
+        # Make prediction
+        results = detector.predict(features, return_probabilities=True)
+        
+        if isinstance(results, tuple) and len(results) >= 2:
+            pred = int(results[0][0])
+            prob = float(results[1][0])
+        else:
+            pred = int(results[0])
+            prob = float(results[0])
+        
+        confidence = abs(prob - 0.5) * 2
+        
+        return PredictResponse(
+            prediction=pred,
+            probability=prob,
+            confidence=confidence,
+            is_fake=bool(pred == 1),
+            model_id=request.model_id,
+            metadata=metadata
+        )
+    except Exception as e:
+        logger.error(f"Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
