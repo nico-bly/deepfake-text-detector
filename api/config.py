@@ -117,11 +117,12 @@ class Settings(BaseSettings):
         cls,
         settings_cls,
         init_settings,
-        _env_settings,
+        env_settings,
         dotenv_settings,
         file_secret_settings,
     ):
         """Use custom source for environment variables"""
+        _ = env_settings  # Use custom source instead of default env source
         return (
             init_settings,
             CommaSeparatedListSource(settings_cls),
