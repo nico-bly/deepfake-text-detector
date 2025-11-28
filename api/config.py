@@ -1,4 +1,4 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator
 from typing import List, Literal, Optional, Dict, Any
 from enum import Enum
@@ -6,14 +6,12 @@ from functools import lru_cache
 import json
 
 class InferenceBackend(str, Enum):
-    """Supported inference backends"""
     LOCAL = "local"
     MODAL = "modal"
     CLIENT_SIDE = "client"
 
 
 class ModelConfig:
-    """Model size and backend selection"""
     def __init__(
         self,
         model_id: str,
@@ -28,12 +26,6 @@ class ModelConfig:
 
 
 class Settings(BaseSettings):
-    # ===== Server Configuration =====
-    API_HOST: str = "0.0.0.0"
-    API_PORT: int = 8000
-    API_BASE_URL: str = "http://localhost:8000"
-    API_ROOT_PATH: str = ""
-    
     # ===== CORS Configuration =====
     ALLOWED_ORIGINS: List[str] = Field(
         default=[
@@ -43,6 +35,12 @@ class Settings(BaseSettings):
         ],
         description="Allowed CORS origins (comma-separated)"
     )
+    
+    # ===== Server Configuration =====
+    API_HOST: str = "0.0.0.0"
+    API_PORT: int = 8000
+    API_BASE_URL: str = "http://localhost:8000"
+    API_ROOT_PATH: str = ""
     
     # ===== Server Settings =====
     PYTHONUNBUFFERED: bool = True
@@ -90,10 +88,12 @@ class Settings(BaseSettings):
     # ===== Security - API Key =====
     API_KEY: str = "change-me-in-production"
     
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
-        extra = "ignore"
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        case_sensitive=False,
+        extra="ignore",
+        json_schema_extra={"ALLOWED_ORIGINS": "comma-separated string"}
+    )
     
     @field_validator("ALLOWED_ORIGINS", mode="before")
     @classmethod
@@ -103,16 +103,16 @@ class Settings(BaseSettings):
             return v
         
         if isinstance(v, str):
-            # Remove any quotes if present
+            # Remove any surrounding quotes
             v = v.strip().strip('"').strip("'")
-            # Split by comma and strip whitespace
-            return [origin.strip() for origin in v.split(",") if origin.strip()]
+            # Split by comma and clean up
+            origins = [origin.strip() for origin in v.split(",") if origin.strip()]
+            return origins
         
         return v
     
     def __init__(self, **data):
         super().__init__(**data)
-        # Initialize available models if empty
         if not self.AVAILABLE_MODELS:
             self._init_default_models()
     
