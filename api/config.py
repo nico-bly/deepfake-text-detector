@@ -1,19 +1,15 @@
-"""
-Configuration management with support for multiple inference backends.
-Supports: VPS-local, Modal, Client-side
-"""
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, field_validator
 from typing import List, Literal, Optional, Dict, Any
 from enum import Enum
 from functools import lru_cache
-import os
+import json
 
 class InferenceBackend(str, Enum):
     """Supported inference backends"""
-    LOCAL = "local"          # Run on VPS
-    MODAL = "modal"          # Run on Modal serverless
-    CLIENT_SIDE = "client"   # Run on client (send metadata only)
+    LOCAL = "local"
+    MODAL = "modal"
+    CLIENT_SIDE = "client"
 
 
 class ModelConfig:
@@ -39,11 +35,14 @@ class Settings(BaseSettings):
     API_ROOT_PATH: str = ""
     
     # ===== CORS Configuration =====
-    ALLOWED_ORIGINS: List[str] = [
-        "http://localhost:3000",
-        "http://localhost:8000",
-        "http://127.0.0.1:3000",
-    ]
+    ALLOWED_ORIGINS: List[str] = Field(
+        default=[
+            "http://localhost:3000",
+            "http://localhost:8000",
+            "http://127.0.0.1:3000",
+        ],
+        description="Allowed CORS origins (comma-separated)"
+    )
     
     # ===== Server Settings =====
     PYTHONUNBUFFERED: bool = True
@@ -52,14 +51,14 @@ class Settings(BaseSettings):
     THREADS_PER_WORKER: int = 1
     
     # ===== Inference Backend Configuration =====
-    DEFAULT_INFERENCE_BACKEND: str = "local"  # local, modal, client
+    DEFAULT_INFERENCE_BACKEND: str = "local"
     ALLOW_CLIENT_SIDE_INFERENCE: bool = True
     ALLOW_MODAL_INFERENCE: bool = False
     
     # ===== VPS Hardware Configuration =====
     VPS_GPU_MEMORY_GB: int = 0
     VPS_CPU_MEMORY_GB: int = 8
-    MAX_VPS_INFERENCE_SIZE: str = "medium"  # tiny, small, medium
+    MAX_VPS_INFERENCE_SIZE: str = "medium"
     
     # ===== Redis Configuration =====
     REDIS_ENABLED: bool = False
@@ -70,7 +69,7 @@ class Settings(BaseSettings):
     DEFAULT_MODEL_ID: str = "sentence-transformers_all-MiniLM-L6-v2"
     SAVED_MODELS_DIR: str = "saved_models"
     
-    # ===== Modal Configuration (Required by InferenceRouter) =====
+    # ===== Modal Configuration =====
     MODAL_ENABLED: bool = False
     MODAL_TOKEN_ID: Optional[str] = None
     MODAL_TOKEN_SECRET: Optional[str] = None
@@ -88,10 +87,28 @@ class Settings(BaseSettings):
     # ===== Available Models Registry =====
     AVAILABLE_MODELS: Dict[str, ModelConfig] = {}
     
+    # ===== Security - API Key =====
+    API_KEY: str = "change-me-in-production"
+    
     class Config:
         env_file = ".env"
         case_sensitive = False
         extra = "ignore"
+    
+    @field_validator("ALLOWED_ORIGINS", mode="before")
+    @classmethod
+    def parse_allowed_origins(cls, v):
+        """Parse ALLOWED_ORIGINS from comma-separated string"""
+        if isinstance(v, list):
+            return v
+        
+        if isinstance(v, str):
+            # Remove any quotes if present
+            v = v.strip().strip('"').strip("'")
+            # Split by comma and strip whitespace
+            return [origin.strip() for origin in v.split(",") if origin.strip()]
+        
+        return v
     
     def __init__(self, **data):
         super().__init__(**data)
@@ -107,12 +124,6 @@ class Settings(BaseSettings):
                 size_category="small",
                 preferred_backend=InferenceBackend.LOCAL,
                 fallback_backends=[InferenceBackend.LOCAL, InferenceBackend.CLIENT_SIDE],
-            ),
-            "sentence-transformers_all-mpnet-base-v2": ModelConfig(
-                model_id="sentence-transformers_all-mpnet-base-v2",
-                size_category="medium",
-                preferred_backend=InferenceBackend.LOCAL,
-                fallback_backends=[InferenceBackend.LOCAL],
             ),
         }
 
