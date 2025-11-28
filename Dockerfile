@@ -65,11 +65,16 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Run application with gunicorn + uvicorn workers for production
-CMD ["gunicorn", \
-     "--workers", "${WORKERS:-2}", \
-     "--worker-class", "uvicorn.workers.UvicornWorker", \
-     "--bind", "0.0.0.0:8000", \
-     "--access-logfile", "-", \
-     "--error-logfile", "-", \
-     "--timeout", "120", \
-     "api.app_v2:app"]
+ENV WORKERS=4
+ENV THREADS_PER_WORKER=1
+
+# CMD using shell expansion
+CMD sh -c "gunicorn \
+    --workers $WORKERS \
+    --threads $THREADS_PER_WORKER \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --bind 0.0.0.0:8000 \
+    --timeout 120 \
+    --access-logfile - \
+    --error-logfile - \
+    api.app_v2:app"
