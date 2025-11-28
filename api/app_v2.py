@@ -39,7 +39,7 @@ router = InferenceRouter(settings)
 # Security - API Key Authentication
 # ============================================================================
 
-API_KEY = os.getenv("API_KEY", "your-super-secret-api-key-here")
+API_KEY = settings.VITE_API_KEY
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 async def verify_api_key(api_key: str = Depends(api_key_header)) -> str:
