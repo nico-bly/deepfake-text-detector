@@ -1,8 +1,11 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings.sources import EnvSettingsSource
 from pydantic import Field, field_validator
 from typing import List, Literal, Optional, Dict, Any
 from enum import Enum
 from functools import lru_cache
+import os
+import json
 
 class InferenceBackend(str, Enum):
     LOCAL = "local"
@@ -22,6 +25,22 @@ class ModelConfig:
         self.size_category = size_category
         self.preferred_backend = preferred_backend
         self.fallback_backends = fallback_backends or [InferenceBackend.LOCAL]
+
+
+class CommaSeparatedListSource(EnvSettingsSource):
+    """Custom env source that handles comma-separated lists before JSON parsing"""
+    
+    def prepare_field_value(self, field_name, field, value, value_is_complex):
+        """Override to handle comma-separated strings for List fields"""
+        # For ALLOWED_ORIGINS, parse as comma-separated string instead of JSON
+        if field_name == "ALLOWED_ORIGINS" and isinstance(value, str):
+            # Check if it looks like JSON (starts with [ or {)
+            if not (value.strip().startswith('[') or value.strip().startswith('{')):
+                # Parse as comma-separated
+                return [origin.strip() for origin in value.split(',') if origin.strip()]
+        
+        # For other fields, use default behavior
+        return super().prepare_field_value(field_name, field, value, value_is_complex)
 
 
 class Settings(BaseSettings):
@@ -87,28 +106,30 @@ class Settings(BaseSettings):
         env_file=".env",
         case_sensitive=False,
         extra="ignore",
+        json_schema_extra=None,
     )
-    
-    @field_validator("ALLOWED_ORIGINS", mode="before")
-    @classmethod
-    def parse_allowed_origins(cls, v):
-        """Parse ALLOWED_ORIGINS from comma-separated string to list"""
-        if isinstance(v, list):
-            return v
-        
-        if isinstance(v, str):
-            # Remove any surrounding quotes
-            v = v.strip().strip('"').strip("'")
-            # Split by comma and clean up
-            origins = [origin.strip() for origin in v.split(",") if origin.strip()]
-            return origins
-        
-        return v
     
     def __init__(self, **data):
         super().__init__(**data)
         if not self.AVAILABLE_MODELS:
             self._init_default_models()
+    
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings,
+        env_settings,
+        dotenv_settings,
+        file_settings,
+    ):
+        """Use custom source for environment variables"""
+        return (
+            init_settings,
+            CommaSeparatedListSource(settings_cls),
+            dotenv_settings,
+            file_settings,
+        )
     
     def _init_default_models(self):
         """Initialize default model configurations"""
