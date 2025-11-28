@@ -1,11 +1,9 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic_settings.sources import EnvSettingsSource
-from pydantic import Field, field_validator
+from pydantic import Field
 from typing import List, Literal, Optional, Dict, Any
 from enum import Enum
 from functools import lru_cache
-import os
-import json
 
 class InferenceBackend(str, Enum):
     LOCAL = "local"
@@ -119,16 +117,16 @@ class Settings(BaseSettings):
         cls,
         settings_cls,
         init_settings,
-        env_settings,
+        _env_settings,
         dotenv_settings,
-        file_settings,
+        file_secret_settings,
     ):
         """Use custom source for environment variables"""
         return (
             init_settings,
             CommaSeparatedListSource(settings_cls),
             dotenv_settings,
-            file_settings,
+            file_secret_settings,
         )
     
     def _init_default_models(self):
