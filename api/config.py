@@ -3,7 +3,6 @@ from pydantic import Field, field_validator
 from typing import List, Literal, Optional, Dict, Any
 from enum import Enum
 from functools import lru_cache
-import json
 
 class InferenceBackend(str, Enum):
     LOCAL = "local"
@@ -88,7 +87,6 @@ class Settings(BaseSettings):
         env_file=".env",
         case_sensitive=False,
         extra="ignore",
-        json_schema_extra={"ALLOWED_ORIGINS": "comma-separated string"}
     )
     
     @field_validator("ALLOWED_ORIGINS", mode="before")
@@ -128,11 +126,3 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Get singleton settings instance"""
     return Settings()
-
-
-def get_model_config(model_id: str) -> ModelConfig:
-    """Get configuration for a specific model"""
-    settings = get_settings()
-    if model_id not in settings.AVAILABLE_MODELS:
-        raise ValueError(f"Model '{model_id}' not configured")
-    return settings.AVAILABLE_MODELS[model_id]
