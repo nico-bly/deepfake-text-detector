@@ -28,12 +28,8 @@ class ModelConfig:
 class Settings(BaseSettings):
     # ===== CORS Configuration =====
     ALLOWED_ORIGINS: List[str] = Field(
-        default=[
-            "http://localhost:3000",
-            "http://localhost:8000",
-            "http://127.0.0.1:3000",
-        ],
-        description="Allowed CORS origins (comma-separated)"
+        default=["http://localhost:3000", "http://localhost:8000", "http://127.0.0.1:3000"],
+        description="Allowed CORS origins (can be set as comma-separated string)"
     )
     
     # ===== Server Configuration =====
@@ -98,7 +94,7 @@ class Settings(BaseSettings):
     @field_validator("ALLOWED_ORIGINS", mode="before")
     @classmethod
     def parse_allowed_origins(cls, v):
-        """Parse ALLOWED_ORIGINS from comma-separated string"""
+        """Parse ALLOWED_ORIGINS from comma-separated string to list"""
         if isinstance(v, list):
             return v
         
