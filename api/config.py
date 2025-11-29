@@ -51,7 +51,8 @@ class Settings(BaseSettings):
     # ===== Server Configuration =====
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8000
-    API_BASE_URL: str = "http://localhost:8000"
+    #API_BASE_URL: str = "http://localhost:8000"
+    VITE_API_BASE_URL: str = "http://localhost:8000"
     API_ROOT_PATH: str = ""
     
     # ===== Server Settings =====
@@ -98,7 +99,7 @@ class Settings(BaseSettings):
     AVAILABLE_MODELS: Dict[str, ModelConfig] = {}
     
     # ===== Security - API Key =====
-    API_KEY: str = "change-me-in-production"
+    VITE_API_KEY: str = "change-me-in-production"
     
     model_config = SettingsConfigDict(
         env_file=".env",
