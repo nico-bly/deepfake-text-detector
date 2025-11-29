@@ -83,8 +83,8 @@ class BaseInferenceEngine(ABC):
 class LocalInferenceEngine(BaseInferenceEngine):
     """VPS-local inference engine"""
     
-    def __init__(self, models_dir: str = "/app/saved_models_prod"):
-        self.models_dir = Path(models_dir)
+    def __init__(self, models_dir: str = "/saved_models_prod"):
+        self.models_dir = Path(models_dir).resolve()
         self.detector_cache = {}
         self.extractor_cache = {}
         self.available = False
@@ -491,7 +491,7 @@ class InferenceRouter:
     
     def __init__(self, settings):
         self.settings = settings
-        self.local_engine = LocalInferenceEngine()
+        self.local_engine = LocalInferenceEngine(models_dir=settings.SAVED_MODELS_DIR)
         self.modal_engine = ModalInferenceEngine(
             settings.MODAL_TOKEN_ID,
             settings.MODAL_TOKEN_SECRET,
