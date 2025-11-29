@@ -132,15 +132,19 @@ class Settings(BaseSettings):
         )
     
     def _init_default_models(self):
-        """Initialize default model configurations"""
-        self.AVAILABLE_MODELS = {
-            "sentence-transformers_all-MiniLM-L6-v2": ModelConfig(
-                model_id="sentence-transformers_all-MiniLM-L6-v2",
-                size_category="small",
-                preferred_backend=InferenceBackend.LOCAL,
+        """Initialize default model configurations from model_mapping"""
+        from .model_mapping import DATASET_MODEL_MAPPING
+        
+        # Auto-register all mapped models
+        for (dataset, frontend_model_id), mapping in DATASET_MODEL_MAPPING.items():
+            # Use backend_model_file as the key for internal registry
+            backend_key = mapping.backend_model_file
+            self.AVAILABLE_MODELS[backend_key] = ModelConfig(
+                model_id=backend_key,
+                size_category="medium",  # default
+                preferred_backend=InferenceBackend.LOCAL if mapping.backend_type.value == "vps" else InferenceBackend.CLIENT_SIDE,
                 fallback_backends=[InferenceBackend.LOCAL, InferenceBackend.CLIENT_SIDE],
-            ),
-        }
+            )
 
 
 @lru_cache()
