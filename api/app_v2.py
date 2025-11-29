@@ -128,8 +128,8 @@ class PredictRequest(BaseModel):
 class PredictResponse(BaseModel):
     """Single prediction response"""
     prediction: int = Field(..., description="0=human, 1=AI-generated")
-    probability: float = Field(..., description="Probability [0-1]")
-    confidence: float = Field(..., description="Confidence [0-1]")
+    probability: float = Field(..., description="Probability percentage [0-100]")
+    confidence: float = Field(..., description="Confidence percentage [0-100]")
     is_fake: bool = Field(..., description="True if AI-generated")
     backend: str = Field(..., description="Backend used")
     model_id: str = Field(..., description="Model used (dataset/model_id)")
@@ -315,8 +315,8 @@ async def predict(
     Response:
     {
         "prediction": 1,
-        "probability": 0.87,
-        "confidence": 0.74,
+        "probability": 87.0,
+        "confidence": 74.0,
         "is_fake": true,
         "backend": "vps",
         "model_id": "human-ai-binary/small-perplexity",
@@ -371,10 +371,14 @@ async def predict(
         
         latency = (time.time() - start_time) * 1000
         
+        # Convert probability to percentage (0-100)
+        probability_percent = result.probability * 100
+        confidence_percent = result.confidence * 100
+        
         return PredictResponse(
             prediction=result.prediction,
-            probability=result.probability,
-            confidence=result.confidence,
+            probability=probability_percent,
+            confidence=confidence_percent,
             is_fake=result.prediction == 1,
             backend=result.backend.value,
             model_id=f"{request.dataset}/{request.model_id}",
@@ -473,8 +477,8 @@ async def batch_predict(
             
             predictions.append(PredictResponse(
                 prediction=result.prediction,
-                probability=result.probability,
-                confidence=result.confidence,
+                probability=result.probability * 100,
+                confidence=result.confidence * 100,
                 is_fake=result.prediction == 1,
                 backend=result.backend.value,
                 model_id=f"{request.dataset}/{request.model_id}",
