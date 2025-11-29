@@ -60,7 +60,7 @@ DATASET_MODEL_MAPPING: Dict[Tuple[str, str], ModelMapping] = {
             "layer": 16,
         }
     ),
-    ("human-ai-binary", "qwen-0.5b"): ModelMapping(
+    ("human-ai-binary", "miniLM"): ModelMapping(
         frontend_model_id="miniLM",
         backend_model_file="human_ai_sentence-transformers_all-MiniLM-L6-v2_embedding_layer2_last_ocsvm",
         backend_type=BackendType.VPS,
