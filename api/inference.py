@@ -83,7 +83,7 @@ class BaseInferenceEngine(ABC):
 class LocalInferenceEngine(BaseInferenceEngine):
     """VPS-local inference engine"""
     
-    def __init__(self, models_dir: str = "/app/saved_models"):
+    def __init__(self, models_dir: str = "/app/saved_models_prod"):
         self.models_dir = Path(models_dir)
         self.detector_cache = {}
         self.extractor_cache = {}
