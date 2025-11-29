@@ -59,6 +59,26 @@ DATASET_MODEL_MAPPING: Dict[Tuple[str, str], ModelMapping] = {
             "model_name": "Qwen/Qwen2.5-0.5B",
             "layer": 16,
         }
+    )
+    
+    }
+
+"""
+
+
+DATASET_MODEL_MAPPING: Dict[Tuple[str, str], ModelMapping] = {
+    # ========== human-ai-binary dataset ==========
+    ("human-ai-binary", "qwen-0.5b"): ModelMapping(
+        frontend_model_id="qwen-0.5b",
+        backend_model_file="human_ai_Qwen_Qwen2.5-0.5B_embedding_layer16_last_l2norm_lr",
+        backend_type=BackendType.VPS,
+        size_mb=50.0,
+        description="Qwen 0.5B embedding model",
+        metadata={
+            "analysis_type": "embedding",
+            "model_name": "Qwen/Qwen2.5-0.5B",
+            "layer": 16,
+        }
     ),
     
     ("human-ai-binary", "deberta-large"): ModelMapping(
@@ -194,6 +214,7 @@ DATASET_MODEL_MAPPING: Dict[Tuple[str, str], ModelMapping] = {
         }
     ),
 }
+"""
 
 
 # ============================================================================
