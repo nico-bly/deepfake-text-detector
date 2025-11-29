@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     
     # ===== Model Configuration =====
     DEFAULT_MODEL_ID: str = "sentence-transformers_all-MiniLM-L6-v2"
-    SAVED_MODELS_DIR: str = "saved_models_prod"
+    SAVED_MODELS_DIR: str = "/app/saved_models_prod"
     
     # ===== Modal Configuration =====
     MODAL_ENABLED: bool = False

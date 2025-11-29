@@ -62,7 +62,7 @@ DATASET_MODEL_MAPPING: Dict[Tuple[str, str], ModelMapping] = {
     ),
     ("human-ai-binary", "miniLM"): ModelMapping(
         frontend_model_id="miniLM",
-        backend_model_file="human_ai_sentence-transformers_all-MiniLM-L6-v2_embedding_layer2_mean_std_l2norm_ocsvm",
+        backend_model_file="human_ai_sentence-transformers_all-MiniLM-L6-v2_embedding_layer2_last_ocsvm",
         backend_type=BackendType.VPS,
         size_mb=27.0,
         description="Mini LM",
