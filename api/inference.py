@@ -193,7 +193,14 @@ class LocalInferenceEngine(BaseInferenceEngine):
             model_path = self.models_dir / f"detector_{model_id}.pkl"
         
         if not model_path.exists():
-            raise FileNotFoundError(f"Model not found: {model_id}")
+            # Provide helpful diagnostics of similarly named files
+            similar = [p.name for p in self.models_dir.glob(f"{model_id}*.pkl")]
+            detector_similar = [p.name for p in self.models_dir.glob(f"detector_{model_id}*.pkl")]
+            candidates = similar + detector_similar
+            raise FileNotFoundError(
+                f"Model not found: {model_id}. Looked for '{model_id}.pkl' and 'detector_{model_id}.pkl'. "
+                f"Found candidates: {candidates if candidates else 'NONE'}"
+            )
         
         # Load detector
         with open(model_path, "rb") as f:
